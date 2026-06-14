@@ -9,6 +9,7 @@ import inspect
 import os
 import queue
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -26,7 +27,7 @@ from typing import Any, AsyncIterator, Callable, Deque, Dict, Iterable, Iterator
 T = TypeVar("T")
 SDK_EVENT_SCHEMA_VERSION = "cloptima.llm.event.v1"
 SDK_BATCH_SCHEMA_VERSION = "cloptima.llm.batch.v1"
-PACKAGE_VERSION = "0.1.3"
+PACKAGE_VERSION = "0.2.0"
 DEFAULT_API_BASE_URL = "https://api.cloptima.ai"
 SDK_INGEST_PATH = "/v1/ai/integrations/sdk/events"
 OTLP_TRACES_PATH = "/v1/ai/integrations/otlp/traces"
@@ -507,6 +508,161 @@ def _clean_usage_map(values: Optional[Dict[str, Any]]) -> Dict[str, int]:
     return normalized
 
 
+def _coerce_mapping_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    records: List[Dict[str, Any]] = []
+    for item in value:
+        record = _coerce_mapping(item)
+        if record:
+            records.append(record)
+    return records
+
+
+def _runtime_positive_usage_unit(value: Any, *keys: str) -> Optional[int]:
+    return _clean_int(_mapping_field(_coerce_mapping(value), *keys))
+
+
+def _detail_modality_token_count(value: Any, modality: str) -> Optional[int]:
+    direct = _runtime_positive_usage_unit(
+        value,
+        f"{modality}_tokens",
+        f"{modality}_token_count",
+        f"{modality}TokenCount",
+    )
+    if direct is not None:
+        return direct
+    total = 0
+    saw_match = False
+    for entry in _coerce_mapping_list(value):
+        entry_modality = _clean_str(_mapping_field(entry, "modality", "type", "kind"))
+        if (entry_modality or "").lower() != modality:
+            continue
+        count = _clean_int(_mapping_field(entry, "tokenCount", "token_count", "tokens", "count"))
+        if count is None:
+            continue
+        total += count
+        saw_match = True
+    return total if saw_match else None
+
+
+def _accumulate_streaming_counter(
+    total: Optional[int],
+    last_seen: Optional[int],
+    next_value: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    if next_value is None:
+        return total, last_seen
+    if last_seen is None or total is None:
+        return next_value, next_value
+    if next_value >= last_seen:
+        return total + (next_value - last_seen), next_value
+    return total + next_value, next_value
+
+
+def _accumulate_streaming_usage_map(
+    totals: Dict[str, int],
+    last_seen: Dict[str, int],
+    chunk: Optional[Dict[str, int]],
+) -> None:
+    if not chunk:
+        return
+    for key, value in chunk.items():
+        previous = last_seen.get(key)
+        if previous is None:
+            totals[key] = totals.get(key, 0) + value
+        elif value >= previous:
+            totals[key] = totals.get(key, 0) + (value - previous)
+        else:
+            totals[key] = totals.get(key, 0) + value
+        last_seen[key] = value
+
+
+def _extract_runtime_extra_usage_units(
+    usage: Mapping[str, Any],
+    prompt_details: Optional[Any] = None,
+    completion_details: Optional[Any] = None,
+) -> Dict[str, int]:
+    usage_mapping = _coerce_mapping(usage)
+    return _clean_usage_map(
+        {
+            "cache_write": _runtime_positive_usage_unit(usage_mapping, "cache_creation_input_tokens", "cache_write_input_tokens")
+            or _runtime_positive_usage_unit(prompt_details, "cache_creation_input_tokens", "cache_write_input_tokens"),
+            "cache_write_5m": _runtime_positive_usage_unit(usage_mapping, "cache_creation_input_tokens_5m", "cache_write_input_tokens_5m")
+            or _runtime_positive_usage_unit(prompt_details, "cache_creation_input_tokens_5m", "cache_write_input_tokens_5m"),
+            "cache_write_1h": _runtime_positive_usage_unit(usage_mapping, "cache_creation_input_tokens_1h", "cache_write_input_tokens_1h")
+            or _runtime_positive_usage_unit(prompt_details, "cache_creation_input_tokens_1h", "cache_write_input_tokens_1h"),
+            "input_image": _runtime_positive_usage_unit(
+                usage_mapping,
+                "input_image_tokens",
+                "image_input_tokens",
+                "inputImageTokens",
+                "imageInputTokens",
+                "inputImageTokenCount",
+                "input_image_token_count",
+            ) or _detail_modality_token_count(prompt_details, "image"),
+            "output_image": _runtime_positive_usage_unit(
+                usage_mapping,
+                "output_image_tokens",
+                "image_output_tokens",
+                "outputImageTokens",
+                "imageOutputTokens",
+                "outputImageTokenCount",
+                "output_image_token_count",
+            ) or _detail_modality_token_count(completion_details, "image"),
+            "input_audio": _runtime_positive_usage_unit(
+                usage_mapping,
+                "input_audio_tokens",
+                "audio_input_tokens",
+                "inputAudioTokens",
+                "audioInputTokens",
+                "inputAudioTokenCount",
+                "input_audio_token_count",
+            ) or _detail_modality_token_count(prompt_details, "audio"),
+            "output_audio": _runtime_positive_usage_unit(
+                usage_mapping,
+                "output_audio_tokens",
+                "audio_output_tokens",
+                "outputAudioTokens",
+                "audioOutputTokens",
+                "outputAudioTokenCount",
+                "output_audio_token_count",
+            ) or _detail_modality_token_count(completion_details, "audio"),
+            "input_video": _runtime_positive_usage_unit(
+                usage_mapping,
+                "input_video_tokens",
+                "video_input_tokens",
+                "inputVideoTokens",
+                "videoInputTokens",
+                "inputVideoTokenCount",
+                "input_video_token_count",
+            ) or _detail_modality_token_count(prompt_details, "video"),
+            "output_video": _runtime_positive_usage_unit(
+                usage_mapping,
+                "output_video_tokens",
+                "video_output_tokens",
+                "outputVideoTokens",
+                "videoOutputTokens",
+                "outputVideoTokenCount",
+                "output_video_token_count",
+            ) or _detail_modality_token_count(completion_details, "video"),
+            "search_request": _runtime_positive_usage_unit(
+                usage_mapping,
+                "search_requests",
+                "web_search_requests",
+                "searchRequests",
+                "webSearchRequests",
+            ),
+            "request": _runtime_positive_usage_unit(
+                usage_mapping,
+                "requests",
+                "request_count",
+                "requestCount",
+            ),
+        }
+    )
+
+
 def _strip_none(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -717,8 +873,30 @@ def _resolve_delivery_mode(mode: Optional[str]) -> str:
     return mode if mode in {"cloptima_http", "otlp_http"} else "cloptima_http"
 
 
+def _is_local_api_base_url(value: str) -> bool:
+    return bool(re.match(r"^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?:/|$)", value, re.IGNORECASE))
+
+
+def _with_default_api_base_scheme(value: str) -> str:
+    trimmed = str(value or "").strip()
+    if not trimmed:
+        return DEFAULT_API_BASE_URL
+    if re.match(r"^[a-z][a-z0-9+.\-]*://", trimmed, re.IGNORECASE):
+        return trimmed
+    if trimmed.startswith("//"):
+        return f"https:{trimmed}"
+    scheme = "http" if _is_local_api_base_url(trimmed) else "https"
+    return f"{scheme}://{trimmed}"
+
+
 def _resolve_api_base_url(api_base_url: Optional[str]) -> str:
-    return (_clean_str(api_base_url) or DEFAULT_API_BASE_URL).rstrip("/")
+    candidate = _with_default_api_base_scheme(_clean_str(api_base_url) or DEFAULT_API_BASE_URL)
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Invalid Cloptima API base URL: {api_base_url}")
+    if (parsed.path and parsed.path != "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError(f"Cloptima API base URL must not include a path, query, or hash: {api_base_url}")
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
 
 def _resolve_ingest_url(api_base_url: str) -> str:
@@ -2032,6 +2210,7 @@ class CloptimaLLMObservability:
                 reasoning_tokens=extracted.get("reasoning_tokens"),
                 cached_input_tokens=extracted.get("cached_input_tokens"),
                 extra_usage_units=extracted.get("extra_usage_units") or {},
+                vendor_reported_cost_usd=extracted.get("vendor_reported_cost_usd"),
                 cache_hit=extracted.get("cache_hit"),
                 started_at=started,
                 completed_at=completed,
@@ -2106,6 +2285,7 @@ class CloptimaLLMObservability:
                 reasoning_tokens=extracted.get("reasoning_tokens"),
                 cached_input_tokens=extracted.get("cached_input_tokens"),
                 extra_usage_units=extracted.get("extra_usage_units") or {},
+                vendor_reported_cost_usd=extracted.get("vendor_reported_cost_usd"),
                 cache_hit=extracted.get("cache_hit"),
                 started_at=started,
                 completed_at=completed,
@@ -2183,6 +2363,7 @@ class CloptimaLLMObservability:
                 reasoning_tokens=extracted.get("reasoning_tokens"),
                 cached_input_tokens=extracted.get("cached_input_tokens"),
                 extra_usage_units=extracted.get("extra_usage_units") or {},
+                vendor_reported_cost_usd=extracted.get("vendor_reported_cost_usd"),
                 cache_hit=extracted.get("cache_hit"),
                 started_at=started,
                 completed_at=completed,
@@ -2269,6 +2450,7 @@ class CloptimaLLMObservability:
                 reasoning_tokens=extracted.get("reasoning_tokens"),
                 cached_input_tokens=extracted.get("cached_input_tokens"),
                 extra_usage_units=extracted.get("extra_usage_units") or {},
+                vendor_reported_cost_usd=extracted.get("vendor_reported_cost_usd"),
                 cache_hit=extracted.get("cache_hit"),
                 started_at=started,
                 completed_at=completed,
@@ -2925,43 +3107,50 @@ def init_from_env(
             return disabled_client(error)
         return disabled_client()
 
-    return CloptimaLLMObservability(
-        api_base_url=resolved_api_base_url or "",
-        api_key=resolved_api_key or "",
-        default_attribution=LLMAttribution(
-            app_id=resolved_app_id or "",
-            environment=resolved_environment or "",
-            team_id=resolved_team_id,
-            feature_id=_clean_str(attribution_values.get("feature_id")),
-            workflow_id=_clean_str(attribution_values.get("workflow_id")),
-            business_unit=_clean_str(attribution_values.get("business_unit")),
-            cost_center=_clean_str(attribution_values.get("cost_center")),
-            product=_clean_str(attribution_values.get("product")),
-            customer_segment=_clean_str(attribution_values.get("customer_segment")),
-            end_customer_id=_clean_str(attribution_values.get("end_customer_id")),
-            tenant_id=_clean_str(attribution_values.get("tenant_id")),
-            release=_clean_str(attribution_values.get("release")),
-            actor_id=_clean_str(attribution_values.get("actor_id")),
-            actor_type=_clean_str(attribution_values.get("actor_type")),
-        ),
-        delivery_mode=delivery_mode or _clean_str(current_env.get(INIT_DELIVERY_MODE_ENV)) or "cloptima_http",
-        otlp_headers=otlp_headers,
-        otlp_service_name=otlp_service_name or _clean_str(current_env.get(INIT_OTLP_SERVICE_NAME_ENV)) or "cloptima-llm-observability",
-        otlp_service_version=otlp_service_version or _clean_str(current_env.get(INIT_OTLP_SERVICE_VERSION_ENV)),
-        sdk_name=sdk_name,
-        sdk_version=sdk_version,
-        timeout_seconds=timeout_seconds,
-        metadata_policy=metadata_policy,
-        on_error=on_error,
-        on_drop=on_drop,
-        async_queue_max_size=async_queue_max_size,
-        async_batch_size=async_batch_size,
-        async_flush_interval_seconds=async_flush_interval_seconds,
-        async_retry_count=async_retry_count,
-        async_retry_backoff_seconds=async_retry_backoff_seconds,
-        async_retry_jitter_ratio=async_retry_jitter_ratio,
-        async_http_client=async_http_client,
-    )
+    try:
+        return CloptimaLLMObservability(
+            api_base_url=resolved_api_base_url or "",
+            api_key=resolved_api_key or "",
+            default_attribution=LLMAttribution(
+                app_id=resolved_app_id or "",
+                environment=resolved_environment or "",
+                team_id=resolved_team_id,
+                feature_id=_clean_str(attribution_values.get("feature_id")),
+                workflow_id=_clean_str(attribution_values.get("workflow_id")),
+                business_unit=_clean_str(attribution_values.get("business_unit")),
+                cost_center=_clean_str(attribution_values.get("cost_center")),
+                product=_clean_str(attribution_values.get("product")),
+                customer_segment=_clean_str(attribution_values.get("customer_segment")),
+                end_customer_id=_clean_str(attribution_values.get("end_customer_id")),
+                tenant_id=_clean_str(attribution_values.get("tenant_id")),
+                release=_clean_str(attribution_values.get("release")),
+                actor_id=_clean_str(attribution_values.get("actor_id")),
+                actor_type=_clean_str(attribution_values.get("actor_type")),
+            ),
+            delivery_mode=delivery_mode or _clean_str(current_env.get(INIT_DELIVERY_MODE_ENV)) or "cloptima_http",
+            otlp_headers=otlp_headers,
+            otlp_service_name=otlp_service_name or _clean_str(current_env.get(INIT_OTLP_SERVICE_NAME_ENV)) or "cloptima-llm-observability",
+            otlp_service_version=otlp_service_version or _clean_str(current_env.get(INIT_OTLP_SERVICE_VERSION_ENV)),
+            sdk_name=sdk_name,
+            sdk_version=sdk_version,
+            timeout_seconds=timeout_seconds,
+            metadata_policy=metadata_policy,
+            on_error=on_error,
+            on_drop=on_drop,
+            async_queue_max_size=async_queue_max_size,
+            async_batch_size=async_batch_size,
+            async_flush_interval_seconds=async_flush_interval_seconds,
+            async_retry_count=async_retry_count,
+            async_retry_backoff_seconds=async_retry_backoff_seconds,
+            async_retry_jitter_ratio=async_retry_jitter_ratio,
+            async_http_client=async_http_client,
+        )
+    except Exception as exc:
+        if on_init_error:
+            on_init_error(exc)
+        if strict:
+            raise
+        return disabled_client(exc)
 
 
 def extract_openai_usage(response: Any) -> Dict[str, Any]:
@@ -2980,13 +3169,7 @@ def extract_openai_usage(response: Any) -> Dict[str, Any]:
             "total_tokens": _clean_int(usage.get("total_tokens")),
             "reasoning_tokens": _clean_int(completion_details.get("reasoning_tokens")),
             "cached_input_tokens": cached_tokens,
-            "extra_usage_units": _clean_usage_map(
-                {
-                    "cache_write": prompt_details.get("cache_creation_input_tokens"),
-                    "cache_write_5m": prompt_details.get("cache_creation_input_tokens_5m"),
-                    "cache_write_1h": prompt_details.get("cache_creation_input_tokens_1h"),
-                }
-            ) or None,
+            "extra_usage_units": _extract_runtime_extra_usage_units(usage, prompt_details, completion_details) or None,
             "cache_hit": True if cached_tokens else None,
         }
     )
@@ -3031,9 +3214,7 @@ def extract_anthropic_usage(response: Any) -> Dict[str, Any]:
     cache_read_tokens = _clean_int(usage.get("cache_read_input_tokens"))
     extra_usage_units = _clean_usage_map(
         {
-            "cache_write": usage.get("cache_creation_input_tokens"),
-            "cache_write_5m": usage.get("cache_creation_input_tokens_5m"),
-            "cache_write_1h": usage.get("cache_creation_input_tokens_1h"),
+            **_extract_runtime_extra_usage_units(usage),
             "server_tool_use": usage.get("server_tool_use"),
         }
     )
@@ -3062,7 +3243,11 @@ def extract_anthropic_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     input_tokens = None
     output_tokens = None
     cache_read_tokens = None
-    cache_write_tokens = None
+    last_input_tokens = None
+    last_output_tokens = None
+    last_cache_read_tokens = None
+    extra_usage_units: Dict[str, int] = {}
+    last_extra_usage_units: Dict[str, int] = {}
     for chunk in chunks:
         record = _coerce_mapping(chunk)
         if not record:
@@ -3074,10 +3259,22 @@ def extract_anthropic_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
             usage = _nested_mapping(message, "usage")
         else:
             usage = _nested_mapping(record, "usage")
-        input_tokens = _clean_int(usage.get("input_tokens")) or input_tokens
-        output_tokens = _clean_int(usage.get("output_tokens")) or output_tokens
-        cache_read_tokens = _clean_int(usage.get("cache_read_input_tokens")) or cache_read_tokens
-        cache_write_tokens = _clean_int(usage.get("cache_creation_input_tokens")) or cache_write_tokens
+        input_tokens, last_input_tokens = _accumulate_streaming_counter(
+            input_tokens,
+            last_input_tokens,
+            _clean_int(usage.get("input_tokens")),
+        )
+        output_tokens, last_output_tokens = _accumulate_streaming_counter(
+            output_tokens,
+            last_output_tokens,
+            _clean_int(usage.get("output_tokens")),
+        )
+        cache_read_tokens, last_cache_read_tokens = _accumulate_streaming_counter(
+            cache_read_tokens,
+            last_cache_read_tokens,
+            _clean_int(usage.get("cache_read_input_tokens")),
+        )
+        _accumulate_streaming_usage_map(extra_usage_units, last_extra_usage_units, _extract_runtime_extra_usage_units(usage))
     total_tokens = None
     if input_tokens is not None or output_tokens is not None:
         total_tokens = (input_tokens or 0) + (output_tokens or 0)
@@ -3090,7 +3287,7 @@ def extract_anthropic_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
             "cached_input_tokens": cache_read_tokens,
-            "extra_usage_units": _clean_usage_map({"cache_write": cache_write_tokens}) or None,
+            "extra_usage_units": extra_usage_units or None,
             "cache_hit": True if cache_read_tokens else None,
         }
     )
@@ -3099,6 +3296,8 @@ def extract_anthropic_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
 def extract_gemini_usage(response: Any) -> Dict[str, Any]:
     record = _coerce_mapping(response)
     usage = _nested_mapping(record, "usageMetadata", "usage_metadata")
+    prompt_details = _mapping_field(usage, "promptTokensDetails", "prompt_tokens_details", "inputTokensDetails", "input_tokens_details")
+    completion_details = _mapping_field(usage, "candidatesTokensDetails", "candidates_tokens_details", "responseTokensDetails", "response_tokens_details", "outputTokensDetails", "output_tokens_details")
     cached_tokens = _clean_int(_mapping_field(usage, "cachedContentTokenCount", "cached_content_token_count"))
     return _strip_none(
         {
@@ -3110,6 +3309,7 @@ def extract_gemini_usage(response: Any) -> Dict[str, Any]:
             "total_tokens": _clean_int(_mapping_field(usage, "totalTokenCount", "total_token_count")),
             "reasoning_tokens": _clean_int(_mapping_field(usage, "thoughtsTokenCount", "thoughts_token_count", "reasoningTokenCount", "reasoning_token_count")),
             "cached_input_tokens": cached_tokens,
+            "extra_usage_units": _extract_runtime_extra_usage_units(usage, prompt_details, completion_details) or None,
             "cache_hit": True if cached_tokens else None,
         }
     )
@@ -3154,6 +3354,8 @@ def extract_bedrock_usage(response: Any) -> Dict[str, Any]:
     usage = _nested_mapping(record, "usage")
     metrics = _nested_mapping(record, "metrics")
     metadata = _nested_mapping(record, "ResponseMetadata")
+    prompt_details = _mapping_field(usage, "promptTokensDetails", "prompt_tokens_details", "inputTokensDetails", "input_tokens_details")
+    completion_details = _mapping_field(usage, "completionTokensDetails", "completion_tokens_details", "outputTokensDetails", "output_tokens_details")
     return _strip_none(
         {
             "provider": "bedrock",
@@ -3162,6 +3364,7 @@ def extract_bedrock_usage(response: Any) -> Dict[str, Any]:
             "input_tokens": _clean_int(_mapping_field(usage, "inputTokens", "input_tokens")),
             "output_tokens": _clean_int(_mapping_field(usage, "outputTokens", "output_tokens")),
             "total_tokens": _clean_int(_mapping_field(usage, "totalTokens", "total_tokens")),
+            "extra_usage_units": _extract_runtime_extra_usage_units(usage, prompt_details, completion_details) or None,
             "latency_ms": _clean_int(_mapping_field(metrics, "latencyMs", "latency_ms")),
         }
     )
@@ -3171,9 +3374,13 @@ def extract_bedrock_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     """Aggregate Amazon Bedrock streaming usage deltas across chunks."""
     request_id = None
     model = None
-    input_tokens = 0
-    output_tokens = 0
+    input_tokens = None
+    output_tokens = None
+    last_input_tokens = None
+    last_output_tokens = None
     total_tokens = None
+    extra_usage_units: Dict[str, int] = {}
+    last_extra_usage_units: Dict[str, int] = {}
     saw_usage = False
     for chunk in chunks:
         record = _coerce_mapping(chunk)
@@ -3187,12 +3394,18 @@ def extract_bedrock_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
         input_count = _clean_int(_mapping_field(usage, "inputTokens", "input_tokens"))
         output_count = _clean_int(_mapping_field(usage, "outputTokens", "output_tokens"))
         total_count = _clean_int(_mapping_field(usage, "totalTokens", "total_tokens"))
-        if input_count is not None:
-            input_tokens += input_count
+        prompt_details = _mapping_field(usage, "promptTokensDetails", "prompt_tokens_details", "inputTokensDetails", "input_tokens_details")
+        completion_details = _mapping_field(usage, "completionTokensDetails", "completion_tokens_details", "outputTokensDetails", "output_tokens_details")
+        chunk_extra_usage = _extract_runtime_extra_usage_units(
+            usage,
+            prompt_details,
+            completion_details,
+        )
+        input_tokens, last_input_tokens = _accumulate_streaming_counter(input_tokens, last_input_tokens, input_count)
+        output_tokens, last_output_tokens = _accumulate_streaming_counter(output_tokens, last_output_tokens, output_count)
+        if input_count is not None or output_count is not None or chunk_extra_usage:
             saw_usage = True
-        if output_count is not None:
-            output_tokens += output_count
-            saw_usage = True
+        _accumulate_streaming_usage_map(extra_usage_units, last_extra_usage_units, chunk_extra_usage)
         total_tokens = total_count if total_count is not None else total_tokens
     return _strip_none(
         {
@@ -3201,7 +3414,8 @@ def extract_bedrock_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
             "model": model,
             "input_tokens": input_tokens if saw_usage else None,
             "output_tokens": output_tokens if saw_usage else None,
-            "total_tokens": total_tokens if total_tokens is not None else (input_tokens + output_tokens if saw_usage else None),
+            "total_tokens": total_tokens if total_tokens is not None else ((input_tokens or 0) + (output_tokens or 0) if saw_usage else None),
+            "extra_usage_units": extra_usage_units or None,
         }
     )
 
@@ -3367,6 +3581,7 @@ def instrument_openai_compatible_response(
         reasoning_tokens=extracted.get("reasoning_tokens"),
         cached_input_tokens=extracted.get("cached_input_tokens"),
         extra_usage_units=extracted.get("extra_usage_units") or {},
+        vendor_reported_cost_usd=extracted.get("vendor_reported_cost_usd"),
         cache_hit=extracted.get("cache_hit"),
         started_at=started if callable(response) else None,
         completed_at=completed if callable(response) else None,
@@ -3425,6 +3640,7 @@ async def ainstrument_openai_compatible_response(
         reasoning_tokens=extracted.get("reasoning_tokens"),
         cached_input_tokens=extracted.get("cached_input_tokens"),
         extra_usage_units=extracted.get("extra_usage_units") or {},
+        vendor_reported_cost_usd=extracted.get("vendor_reported_cost_usd"),
         cache_hit=extracted.get("cache_hit"),
         started_at=started_at,
         completed_at=completed_at,

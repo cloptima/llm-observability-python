@@ -31,6 +31,42 @@
     }
   },
   {
+    "name": "openai_multimodal_token_usage",
+    "provider": "openai",
+    "kind": "response",
+    "payload": {
+      "id": "chatcmpl-fixture-openai-multimodal",
+      "model": "gpt-4.1-mini",
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 9,
+        "total_tokens": 24,
+        "prompt_tokens_details": {
+          "audio_tokens": 4,
+          "image_tokens": 3
+        },
+        "completion_tokens_details": {
+          "image_tokens": 2,
+          "video_tokens": 5
+        }
+      }
+    },
+    "expected": {
+      "provider": "openai",
+      "provider_request_id": "chatcmpl-fixture-openai-multimodal",
+      "model": "gpt-4.1-mini",
+      "input_tokens": 15,
+      "output_tokens": 9,
+      "total_tokens": 24,
+      "extra_usage_units": {
+        "input_audio": 4,
+        "input_image": 3,
+        "output_image": 2,
+        "output_video": 5
+      }
+    }
+  },
+  {
     "name": "openai_stream_final_usage",
     "provider": "openai",
     "kind": "stream",
@@ -70,6 +106,34 @@
     }
   },
   {
+    "name": "azure_openai_multimodal_usage",
+    "provider": "azure_openai",
+    "kind": "response",
+    "payload": {
+      "id": "chatcmpl-fixture-azure-multimodal",
+      "deployment_name": "gpt-4o-mini-prod",
+      "usage": {
+        "prompt_tokens": 9,
+        "completion_tokens": 6,
+        "total_tokens": 15,
+        "completion_tokens_details": {
+          "image_tokens": 4
+        }
+      }
+    },
+    "expected": {
+      "provider": "azure_openai",
+      "provider_request_id": "chatcmpl-fixture-azure-multimodal",
+      "model": "gpt-4o-mini-prod",
+      "input_tokens": 9,
+      "output_tokens": 6,
+      "total_tokens": 15,
+      "extra_usage_units": {
+        "output_image": 4
+      }
+    }
+  },
+  {
     "name": "anthropic_message_usage",
     "provider": "anthropic",
     "kind": "response",
@@ -93,6 +157,60 @@
       "cached_input_tokens": 4,
       "extra_usage_units": { "cache_write": 3 },
       "cache_hit": true
+    }
+  },
+  {
+    "name": "anthropic_multimodal_token_usage",
+    "provider": "anthropic",
+    "kind": "response",
+    "payload": {
+      "id": "msg-fixture-anthropic-multimodal",
+      "model": "claude-haiku-4-5",
+      "usage": {
+        "input_tokens": 14,
+        "output_tokens": 5,
+        "input_audio_tokens": 9,
+        "output_image_tokens": 2
+      }
+    },
+    "expected": {
+      "provider": "anthropic",
+      "provider_request_id": "msg-fixture-anthropic-multimodal",
+      "model": "claude-haiku-4-5",
+      "input_tokens": 14,
+      "output_tokens": 5,
+      "total_tokens": 19,
+      "extra_usage_units": {
+        "input_audio": 9,
+        "output_image": 2
+      }
+    }
+  },
+  {
+    "name": "anthropic_multimodal_server_tool_usage",
+    "provider": "anthropic",
+    "kind": "response",
+    "payload": {
+      "id": "msg-fixture-anthropic-server-tool",
+      "model": "claude-haiku-4-5",
+      "usage": {
+        "input_tokens": 14,
+        "output_tokens": 5,
+        "input_audio_tokens": 9,
+        "server_tool_use": 2
+      }
+    },
+    "expected": {
+      "provider": "anthropic",
+      "provider_request_id": "msg-fixture-anthropic-server-tool",
+      "model": "claude-haiku-4-5",
+      "input_tokens": 14,
+      "output_tokens": 5,
+      "total_tokens": 19,
+      "extra_usage_units": {
+        "input_audio": 9,
+        "server_tool_use": 2
+      }
     }
   },
   {
@@ -120,6 +238,78 @@
       "cached_input_tokens": 2,
       "extra_usage_units": { "cache_write": 1 },
       "cache_hit": true
+    }
+  },
+  {
+    "name": "gemini_multimodal_usage_metadata",
+    "provider": "gemini",
+    "kind": "response",
+    "payload": {
+      "responseId": "gemini-fixture-multimodal-response",
+      "modelVersion": "gemini-3.5-flash",
+      "usageMetadata": {
+        "promptTokenCount": 17,
+        "candidatesTokenCount": 9,
+        "totalTokenCount": 26,
+        "promptTokensDetails": {
+          "imageTokenCount": 6,
+          "audioTokenCount": 4
+        },
+        "candidatesTokensDetails": {
+          "imageTokenCount": 2,
+          "videoTokenCount": 3
+        }
+      }
+    },
+    "expected": {
+      "provider": "gemini",
+      "provider_request_id": "gemini-fixture-multimodal-response",
+      "model": "gemini-3.5-flash",
+      "input_tokens": 17,
+      "output_tokens": 9,
+      "total_tokens": 26,
+      "extra_usage_units": {
+        "input_image": 6,
+        "input_audio": 4,
+        "output_image": 2,
+        "output_video": 3
+      }
+    }
+  },
+  {
+    "name": "gemini_multimodal_usage_metadata_list_shape",
+    "provider": "gemini",
+    "kind": "response",
+    "payload": {
+      "responseId": "gemini-fixture-multimodal-list-response",
+      "modelVersion": "gemini-3.5-flash",
+      "usageMetadata": {
+        "promptTokenCount": 17,
+        "candidatesTokenCount": 9,
+        "totalTokenCount": 26,
+        "promptTokensDetails": [
+          { "modality": "IMAGE", "tokenCount": 6 },
+          { "modality": "AUDIO", "tokenCount": 4 }
+        ],
+        "candidatesTokensDetails": [
+          { "modality": "IMAGE", "tokenCount": 2 },
+          { "modality": "VIDEO", "tokenCount": 3 }
+        ]
+      }
+    },
+    "expected": {
+      "provider": "gemini",
+      "provider_request_id": "gemini-fixture-multimodal-list-response",
+      "model": "gemini-3.5-flash",
+      "input_tokens": 17,
+      "output_tokens": 9,
+      "total_tokens": 26,
+      "extra_usage_units": {
+        "input_image": 6,
+        "input_audio": 4,
+        "output_image": 2,
+        "output_video": 3
+      }
     }
   },
   {
@@ -164,6 +354,70 @@
       "input_tokens": 5,
       "output_tokens": 6,
       "total_tokens": 11
+    }
+  },
+  {
+    "name": "vertex_multimodal_usage_metadata",
+    "provider": "vertex_ai",
+    "kind": "response",
+    "payload": {
+      "response_id": "vertex-fixture-multimodal-response",
+      "model_version": "gemini-2.5-flash",
+      "usage_metadata": {
+        "prompt_token_count": 17,
+        "candidates_token_count": 9,
+        "total_token_count": 26,
+        "prompt_tokens_details": [
+          { "modality": "IMAGE", "token_count": 6 },
+          { "modality": "AUDIO", "token_count": 4 }
+        ],
+        "candidates_tokens_details": [
+          { "modality": "VIDEO", "token_count": 3 }
+        ]
+      }
+    },
+    "expected": {
+      "provider": "vertex_ai",
+      "provider_request_id": "vertex-fixture-multimodal-response",
+      "model": "gemini-2.5-flash",
+      "input_tokens": 17,
+      "output_tokens": 9,
+      "total_tokens": 26,
+      "extra_usage_units": {
+        "input_image": 6,
+        "input_audio": 4,
+        "output_video": 3
+      }
+    }
+  },
+  {
+    "name": "bedrock_multimodal_response_usage",
+    "provider": "bedrock",
+    "kind": "response",
+    "payload": {
+      "modelId": "anthropic.claude-3-5-sonnet",
+      "usage": {
+        "inputTokens": 20,
+        "outputTokens": 6,
+        "totalTokens": 26,
+        "inputAudioTokens": 7,
+        "outputVideoTokens": 3
+      },
+      "metrics": { "latencyMs": 222 },
+      "ResponseMetadata": { "RequestId": "bedrock-fixture-multimodal-response" }
+    },
+    "expected": {
+      "provider": "bedrock",
+      "provider_request_id": "bedrock-fixture-multimodal-response",
+      "model": "anthropic.claude-3-5-sonnet",
+      "input_tokens": 20,
+      "output_tokens": 6,
+      "total_tokens": 26,
+      "latency_ms": 222,
+      "extra_usage_units": {
+        "input_audio": 7,
+        "output_video": 3
+      }
     }
   },
   {

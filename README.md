@@ -1,6 +1,6 @@
 # Cloptima LLM Observability Python SDK
 
-Capture LLM usage telemetry from your application and send it to Cloptima for cost reporting, attribution, and analytics.
+Capture LLM usage telemetry from your application and send it to Cloptima for cost reporting, attribution, and usage analytics.
 
 This SDK is designed for teams that want observability without replacing their existing provider clients, wrappers, retries, auth, or application security controls.
 
@@ -164,6 +164,16 @@ Built-in usage extractors cover:
 - Vertex AI
 - Bedrock
 
+If a provider reports image, audio, or video token usage, the built-in extractors capture those units in fields such as `input_image`, `output_image`, `input_audio`, and `output_video`. When Cloptima has pricing for that model, those units can be included in cost reporting.
+
+If a provider returns a direct charge, pass or preserve it as `vendor_reported_cost_usd`.
+
+The SDK does not invent media charges for providers that bill by image count, video duration, resolution, or other non-token measures when the provider response does not expose enough pricing data. In those cases, either:
+
+- preserve the provider-reported cost when available
+- map the provider's usage fields into `extra_usage_units`
+- or add your own custom extractor until the provider exposes a stable shape
+
 If a provider response shape drifts, you do not need to replace the whole extractor path. Compose or patch it instead:
 
 - `try_extract_usage(...)`
@@ -171,6 +181,33 @@ If a provider response shape drifts, you do not need to replace the whole extrac
 - `with_usage_overrides(...)`
 - `create_mapped_usage_extractor(...)`
 - `list_supported_providers()`
+
+Example:
+
+```python
+from cloptima_llm_observability import create_mapped_usage_extractor, init_from_env
+
+cloptima = init_from_env()
+
+extract_usage = create_mapped_usage_extractor(
+    defaults={
+        "provider": "gemini",
+    },
+    fields={
+        "model": "modelVersion",
+        "provider_request_id": "responseId",
+        "vendor_reported_cost_usd": "billing.costUsd",
+    },
+    number_fields={
+        "input_tokens": "usage.promptTokenCount",
+        "output_tokens": "usage.responseTokenCount",
+        "total_tokens": "usage.totalTokenCount",
+    },
+    extra_usage_units={
+        "output_image": "usage.outputImageTokenCount",
+    },
+)
+```
 
 ## Attribution fields
 
@@ -221,6 +258,8 @@ Public examples live in `examples/`:
 - `custom_wrapper.py`: existing service wrapper integration
 - `workflow_context.py`: context-first attribution without signature bloat
 - `httpx_transport.py`: shared `httpx` integration
+- `multimodal_tokens.py`: token-based multimodal usage extraction for image, audio, and video inputs and outputs
+- `mapped_extractor.py`: adapt a provider or internal wrapper response without rewriting your integration
 - `otlp_basic.py`: OTLP-compatible delivery to Cloptima
 - `openai_basic.py`, `anthropic_basic.py`, `gemini_basic.py`: provider-specific extractor examples
 

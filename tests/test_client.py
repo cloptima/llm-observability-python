@@ -299,6 +299,26 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         body = json.loads(observed["request"].data.decode("utf-8"))
         self.assertEqual(body["metadata"]["environment"], "production")
 
+    def test_init_from_env_normalizes_scheme_less_and_trailing_slash_api_base_urls(self) -> None:
+        observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed["request"] = request
+            return _FakeResponse()
+
+        client = init_from_env(
+            env={
+                "CLOPTIMA_LLM_OBSERVABILITY_API_KEY": "pat-env",
+                "CLOPTIMA_LLM_OBSERVABILITY_APP_ID": "agent-api",
+                "CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL": "sdk-ingest.example.cloptima.ai/",
+            }
+        )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            client.record(LLMUsageEvent(provider="openai", model="gpt-4o-mini"))
+
+        self.assertEqual(observed["request"].full_url, TEST_INGEST_URL)
+
     def test_is_enabled_requires_api_key_and_app_id_only(self) -> None:
         self.assertFalse(
             is_enabled(
@@ -340,6 +360,39 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
             client.record(LLMUsageEvent(provider="openai", model="gpt-4o-mini"))
 
         self.assertEqual([request.full_url for request in observed_requests], [DEFAULT_OTLP_URL])
+
+    def test_direct_constructor_inferrs_http_for_scheme_less_localhost_api_base_urls(self) -> None:
+        observed_requests = []
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(request)
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url="127.0.0.1:4318/",
+            api_key="pat-env",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="production"),
+            delivery_mode="otlp_http",
+        )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            client.record(LLMUsageEvent(provider="openai", model="gpt-4o-mini"))
+
+        self.assertEqual(observed_requests[0].full_url, "http://127.0.0.1:4318/v1/ai/integrations/otlp/traces")
+        self.assertIsNone(observed_requests[0].headers.get("Authorization"))
+
+    def test_init_from_env_stays_fail_open_but_diagnosable_when_api_base_url_is_invalid(self) -> None:
+        client = init_from_env(
+            env={
+                "CLOPTIMA_LLM_OBSERVABILITY_API_KEY": "pat-env",
+                "CLOPTIMA_LLM_OBSERVABILITY_APP_ID": "agent-api",
+                "CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL": "https://api.cloptima.ai/custom-path",
+            },
+            enabled=True,
+        )
+
+        self.assertFalse(client.is_enabled())
+        self.assertIn("must not include a path, query, or hash", str(client.get_init_error()))
 
     def test_direct_constructor_rejects_dormant_dual_delivery_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, 'delivery_mode "dual" is temporarily disabled'):
@@ -1145,15 +1198,17 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         self.assertNotIn("conversation_id", body["metadata"])
         self.assertNotIn("prompt", body["metadata"])
 
-    def test_init_from_env_rejects_dormant_dual_delivery_mode(self) -> None:
-        with self.assertRaisesRegex(ValueError, 'delivery_mode "dual" is temporarily disabled'):
-            init_from_env(
-                env={
-                    "CLOPTIMA_LLM_OBSERVABILITY_API_KEY": "pat-env",
-                    "CLOPTIMA_LLM_OBSERVABILITY_APP_ID": "agent-api",
-                    "CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE": "dual",
-                }
-            )
+    def test_init_from_env_stays_fail_open_but_diagnosable_when_dual_delivery_mode_is_requested(self) -> None:
+        client = init_from_env(
+            env={
+                "CLOPTIMA_LLM_OBSERVABILITY_API_KEY": "pat-env",
+                "CLOPTIMA_LLM_OBSERVABILITY_APP_ID": "agent-api",
+                "CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE": "dual",
+            }
+        )
+
+        self.assertFalse(client.is_enabled())
+        self.assertIn('delivery_mode "dual" is temporarily disabled', str(client.get_init_error()))
 
     def test_observe_records_successful_openai_usage(self) -> None:
         observed = {}
@@ -1213,6 +1268,48 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         self.assertEqual(observed["body"]["reasoning_tokens"], 1)
         self.assertEqual(observed["body"]["cached_input_tokens"], 2)
         self.assertEqual(observed["body"]["extra_usage_units"], {"cache_write_5m": 4})
+
+    def test_observe_preserves_vendor_reported_cost_from_custom_extractor(self) -> None:
+        observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed["body"] = json.loads(request.data.decode("utf-8"))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+        )
+
+        extractor = create_mapped_usage_extractor(
+            defaults={"provider": "vertex_ai"},
+            fields={
+                "provider_request_id": "response.id",
+                "model": "response.model",
+                "vendor_reported_cost_usd": "billing.cost_usd",
+            },
+            number_fields={
+                "input_tokens": "usage.prompt_tokens",
+                "output_tokens": "usage.completion_tokens",
+            },
+        )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            client.observe(
+                provider="vertex_ai",
+                model="gemini-2.5-pro",
+                fire_and_forget=False,
+                call=lambda: {
+                    "response": {"id": "resp-cost-1", "model": "gemini-2.5-pro"},
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+                    "billing": {"cost_usd": "0.4321"},
+                },
+                extract_usage=extractor,
+            )
+
+        self.assertEqual(observed["body"]["provider_request_id"], "resp-cost-1")
+        self.assertEqual(observed["body"]["vendor_reported_cost_usd"], 0.4321)
 
     def test_instrument_openai_compatible_response_records_existing_response(self) -> None:
         observed = {}
@@ -1298,6 +1395,7 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                     "output_tokens": 5,
                     "cache_read_input_tokens": 3,
                     "cache_creation_input_tokens": 7,
+                    "input_audio_tokens": 4,
                 },
             }),
             {
@@ -1308,7 +1406,7 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                 "output_tokens": 5,
                 "total_tokens": 15,
                 "cached_input_tokens": 3,
-                "extra_usage_units": {"cache_write": 7},
+                "extra_usage_units": {"cache_write": 7, "input_audio": 4},
                 "cache_hit": True,
             },
         )
@@ -1322,6 +1420,13 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                     "totalTokenCount": 24,
                     "thoughtsTokenCount": 2,
                     "cachedContentTokenCount": 4,
+                    "promptTokensDetails": {
+                        "audioTokenCount": 5,
+                        "imageTokenCount": 3,
+                    },
+                    "candidatesTokensDetails": {
+                        "videoTokenCount": 2,
+                    },
                 },
             }),
             {
@@ -1333,9 +1438,46 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                 "total_tokens": 24,
                 "reasoning_tokens": 2,
                 "cached_input_tokens": 4,
+                "extra_usage_units": {
+                    "input_audio": 5,
+                    "input_image": 3,
+                    "output_video": 2,
+                },
                 "cache_hit": True,
             },
         )
+        self.assertEqual(
+            extract_gemini_usage({
+                "responseId": "gemini-response-list-1",
+                "modelVersion": "gemini-2.5-flash",
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 13,
+                    "totalTokenCount": 24,
+                    "promptTokensDetails": [
+                        {"modality": "AUDIO", "tokenCount": 5},
+                        {"modality": "IMAGE", "tokenCount": 3},
+                    ],
+                    "candidatesTokensDetails": [
+                        {"modality": "VIDEO", "tokenCount": 2},
+                    ],
+                },
+            }),
+            {
+                "provider": "gemini",
+                "provider_request_id": "gemini-response-list-1",
+                "model": "gemini-2.5-flash",
+                "input_tokens": 11,
+                "output_tokens": 13,
+                "total_tokens": 24,
+                "extra_usage_units": {
+                    "input_audio": 5,
+                    "input_image": 3,
+                    "output_video": 2,
+                },
+            },
+        )
+
         self.assertEqual(
             extract_vertex_usage({
                 "response_id": "vertex-response-1",
@@ -1351,7 +1493,13 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         self.assertEqual(
             extract_bedrock_usage({
                 "modelId": "anthropic.claude-3-5-sonnet",
-                "usage": {"inputTokens": 20, "outputTokens": 6, "totalTokens": 26},
+                "usage": {
+                    "inputTokens": 20,
+                    "outputTokens": 6,
+                    "totalTokens": 26,
+                    "inputAudioTokens": 7,
+                    "completionTokensDetails": {"imageTokenCount": 2},
+                },
                 "metrics": {"latencyMs": 321},
                 "ResponseMetadata": {"RequestId": "bedrock-request-1"},
             }),
@@ -1362,14 +1510,74 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                 "input_tokens": 20,
                 "output_tokens": 6,
                 "total_tokens": 26,
+                "extra_usage_units": {"input_audio": 7, "output_image": 2},
                 "latency_ms": 321,
+            },
+        )
+
+    def test_stream_usage_aggregators_tolerate_cumulative_counters(self) -> None:
+        self.assertEqual(
+            extract_anthropic_stream_usage([
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg-stream-cumulative",
+                        "model": "claude-3-5-sonnet",
+                        "usage": {"input_tokens": 8, "input_audio_tokens": 2},
+                    },
+                },
+                {
+                    "type": "message_delta",
+                    "usage": {"output_tokens": 2, "cache_creation_input_tokens": 1, "input_audio_tokens": 2},
+                },
+                {
+                    "type": "message_delta",
+                    "usage": {"output_tokens": 4, "cache_creation_input_tokens": 3, "input_audio_tokens": 5},
+                },
+            ]),
+            {
+                "provider": "anthropic",
+                "provider_request_id": "msg-stream-cumulative",
+                "model": "claude-3-5-sonnet",
+                "input_tokens": 8,
+                "output_tokens": 4,
+                "total_tokens": 12,
+                "extra_usage_units": {"cache_write": 3, "input_audio": 5},
+            },
+        )
+        self.assertEqual(
+            extract_bedrock_stream_usage([
+                {
+                    "requestId": "bedrock-stream-cumulative",
+                    "modelId": "anthropic.claude-3-5-sonnet",
+                    "usage": {"inputTokens": 5, "outputTokens": 1, "totalTokens": 6, "outputVideoTokens": 1},
+                },
+                {
+                    "requestId": "bedrock-stream-cumulative",
+                    "modelId": "anthropic.claude-3-5-sonnet",
+                    "usage": {"inputTokens": 5, "outputTokens": 3, "totalTokens": 8, "outputVideoTokens": 2},
+                },
+            ]),
+            {
+                "provider": "bedrock",
+                "provider_request_id": "bedrock-stream-cumulative",
+                "model": "anthropic.claude-3-5-sonnet",
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "total_tokens": 8,
+                "extra_usage_units": {"output_video": 2},
             },
         )
         self.assertEqual(
             extract_azure_openai_usage({
                 "id": "chatcmpl-azure",
                 "deployment_name": "gpt-4o-mini-prod",
-                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                    "completion_tokens_details": {"image_tokens": 4},
+                },
             }),
             {
                 "provider": "azure_openai",
@@ -1378,6 +1586,7 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                 "input_tokens": 1,
                 "output_tokens": 2,
                 "total_tokens": 3,
+                "extra_usage_units": {"output_image": 4},
             },
         )
 
@@ -1607,6 +1816,11 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                 else get_provider_usage_extractor(fixture["provider"])
             )
             self.assertIsNotNone(extractor, f"missing registry extractor for {fixture['provider']}/{fixture['kind']}")
+            self.assertEqual(
+                extractor(fixture["payload"]),
+                fixture["expected"],
+                fixture["name"],
+            )
 
     def test_wrap_observed_service_wraps_multiple_existing_service_methods_together(self) -> None:
         observed_requests = []
@@ -1747,7 +1961,7 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         body = json.loads(observed["content"].decode("utf-8"))
         self.assertEqual(observed["url"], TEST_INGEST_URL)
         self.assertEqual(observed["headers"]["authorization"], "Bearer pat-test")
-        self.assertEqual(observed["headers"]["user-agent"], "cloptima-llm-observability/0.1.3")
+        self.assertEqual(observed["headers"]["user-agent"], "cloptima-llm-observability/0.2.0")
         self.assertEqual(observed["timeout"], 3)
         self.assertEqual(body["provider"], "openai")
         self.assertEqual(body["total_tokens"], 6)
@@ -1983,6 +2197,50 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         self.assertEqual(body["input_tokens"], 11)
         self.assertEqual(body["output_tokens"], 13)
 
+    def test_observe_async_preserves_vendor_reported_cost_from_custom_extractor(self) -> None:
+        observed = {}
+
+        class FakeAsyncClient(_FakeAsyncClient):
+            pass
+
+        FakeAsyncClient.observed = observed
+
+        async def _call():
+            return {
+                "response": {"id": "resp-async-cost-1", "model": "gemini-2.5-pro"},
+                "billing": {"cost_usd": "0.6543"},
+            }
+
+        extractor = create_mapped_usage_extractor(
+            defaults={"provider": "vertex_ai"},
+            fields={
+                "provider_request_id": "response.id",
+                "model": "response.model",
+                "vendor_reported_cost_usd": "billing.cost_usd",
+            },
+        )
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+        )
+
+        with patch.dict(sys.modules, {"httpx": SimpleNamespace(AsyncClient=FakeAsyncClient)}):
+            asyncio.run(
+                client.observe_async(
+                    provider="vertex_ai",
+                    model="gemini-2.5-pro",
+                    fire_and_forget=False,
+                    call=_call,
+                    extract_usage=extractor,
+                )
+            )
+
+        body = json.loads(observed["content"].decode("utf-8"))
+        self.assertEqual(body["provider_request_id"], "resp-async-cost-1")
+        self.assertEqual(body["vendor_reported_cost_usd"], 0.6543)
+
     def test_observe_async_rejects_async_generators_and_points_to_stream_api(self) -> None:
         class FakeAsyncClient(_FakeAsyncClient):
             pass
@@ -2166,6 +2424,49 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         self.assertEqual(observed["body"]["provider_request_id"], "chatcmpl-stream")
         self.assertEqual(observed["body"]["input_tokens"], 5)
         self.assertEqual(observed["body"]["output_tokens"], 7)
+        self.assertEqual(observed["body"]["metadata"]["streamed"], True)
+
+    def test_observe_stream_preserves_vendor_reported_cost_from_custom_extractor(self) -> None:
+        observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed["body"] = json.loads(request.data.decode("utf-8"))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+        )
+
+        chunks = [
+            {"delta": "frame-1"},
+            {"response": {"id": "resp-stream-cost-1", "model": "veo-3"}},
+            {"billing": {"cost_usd": "1.2345"}},
+        ]
+
+        extractor = create_mapped_usage_extractor(
+            defaults={"provider": "vertex_ai"},
+            fields={
+                "provider_request_id": ["response.id"],
+                "model": ["response.model"],
+                "vendor_reported_cost_usd": ["billing.cost_usd"],
+            },
+        )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            emitted = list(
+                client.observe_stream(
+                    provider="vertex_ai",
+                    model="veo-3",
+                    fire_and_forget=False,
+                    call=lambda: iter(chunks),
+                    extract_usage=lambda items: extractor(items[-1] if items else {}),
+                )
+            )
+
+        self.assertEqual(emitted, chunks)
+        self.assertEqual(observed["body"]["vendor_reported_cost_usd"], 1.2345)
         self.assertEqual(observed["body"]["metadata"]["streamed"], True)
 
     def test_instrument_openai_compatible_stream_observes_existing_stream(self) -> None:

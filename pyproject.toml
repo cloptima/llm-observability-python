@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloptima-llm-observability"
-version = "0.1.3"
+version = "0.2.0"
 description = "LLM usage telemetry SDK for Cloptima reporting, attribution, and analytics"
 readme = "README.md"
 requires-python = ">=3.9"
