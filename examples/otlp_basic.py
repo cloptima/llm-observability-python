@@ -1,7 +1,13 @@
 import json
 import urllib.request
 
-from cloptima_llm_observability import extract_openai_usage, init_from_env
+from cloptima_llm_observability import (
+    extract_openai_usage,
+    init_from_env,
+    preview_event_payload,
+    preview_otlp_request,
+    validate_payload,
+)
 
 
 class _FakeResponse:
@@ -39,25 +45,53 @@ def main() -> None:
                 "CLOPTIMA_LLM_OBSERVABILITY_APP_ID": "support-api",
                 "CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT": "dev",
                 "CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE": "otlp_http",
+                "CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_NAME": "agent-api",
+                "CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_VERSION": "2026.06.14",
             }
         )
-        client.observe_call(
-            provider="openai",
-            model="gpt-4.1-mini",
-            call=lambda: {
-                "id": "chatcmpl-otlp-example",
+        preview_payload = preview_event_payload(
+            {
+                "provider": "openai",
                 "model": "gpt-4.1-mini",
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "total_tokens": 15,
-                },
-            },
-            extract_usage=extract_openai_usage,
-            fire_and_forget=False,
-            feature_id="customer_summary",
-            metadata={"integration_mode": "otlp_http"},
+                "app_id": "support-api",
+                "environment": "dev",
+                "feature_id": "customer_summary",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+            }
         )
+        if not validate_payload(preview_payload)["valid"]:
+            raise RuntimeError("preview payload should be valid")
+        preview_request = preview_otlp_request(
+            preview_payload,
+            service_name="agent-api",
+            service_version="2026.06.14",
+        )
+        if not preview_request["resourceSpans"][0]["resource"]["attributes"]:
+            raise RuntimeError("preview request should include resource attributes")
+
+        with client.with_workflow("support_agent", team_id="customer-support"):
+            client.observe_call(
+                provider="openai",
+                model="gpt-4.1-mini",
+                call=lambda: {
+                    "id": "chatcmpl-otlp-example",
+                    "model": "gpt-4.1-mini",
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                },
+                extract_usage=extract_openai_usage,
+                fire_and_forget=False,
+                feature_id="customer_summary",
+                metadata={
+                    "integration_mode": "otlp_http",
+                    "deployment_shape": "enterprise",
+                },
+            )
     finally:
         urllib.request.urlopen = original_urlopen
 

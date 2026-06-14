@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import contextvars
+import functools
 import hashlib
 import json
 import inspect
@@ -14,8 +16,10 @@ from urllib.parse import urlparse
 import urllib.request
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, AsyncIterator, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, TypeVar, Union
 
 
@@ -37,6 +41,11 @@ INIT_TEAM_ID_ENV = f"{INIT_ENV_PREFIX}TEAM_ID"
 INIT_DELIVERY_MODE_ENV = f"{INIT_ENV_PREFIX}DELIVERY_MODE"
 INIT_OTLP_SERVICE_NAME_ENV = f"{INIT_ENV_PREFIX}OTLP_SERVICE_NAME"
 INIT_OTLP_SERVICE_VERSION_ENV = f"{INIT_ENV_PREFIX}OTLP_SERVICE_VERSION"
+_ATTRIBUTION_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "cloptima_llm_observability_attribution_context",
+    default=None,
+)
+UsageExtractor = Callable[[Any], Dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -55,10 +64,6 @@ class LLMAttribution:
     release: Optional[str] = None
     actor_id: Optional[str] = None
     actor_type: Optional[str] = None
-    developer_id: Optional[str] = None
-    cloud_account_id: Optional[str] = None
-    cluster_id: Optional[str] = None
-    repository_id: Optional[str] = None
 
 
 @dataclass
@@ -164,6 +169,76 @@ def _clean_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value is None:
+        return {}
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+        except Exception:
+            pass
+    as_dict = getattr(value, "dict", None)
+    if callable(as_dict):
+        try:
+            dumped = as_dict()
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+        except Exception:
+            pass
+    to_json = getattr(value, "toJSON", None)
+    if callable(to_json):
+        try:
+            dumped = to_json()
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+        except Exception:
+            pass
+    return {}
+
+
+def _mapping_field(mapping: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping.get(key)
+    return None
+
+
+def _nested_mapping(mapping: Mapping[str, Any], *keys: str) -> Dict[str, Any]:
+    return _coerce_mapping(_mapping_field(mapping, *keys))
+
+
+def _split_field_path(path: str) -> List[str]:
+    return [segment.strip() for segment in str(path).split(".") if segment.strip()]
+
+
+def _path_value(mapping: Mapping[str, Any], path: str) -> Any:
+    current: Any = mapping
+    for segment in _split_field_path(path):
+        current_mapping = _coerce_mapping(current)
+        if not current_mapping or segment not in current_mapping:
+            return None
+        current = current_mapping.get(segment)
+    return current
+
+
+def _resolve_mapped_value(mapping: Mapping[str, Any], paths: Union[str, List[str], Tuple[str, ...], None]) -> Any:
+    if paths is None:
+        return None
+    candidates = list(paths) if isinstance(paths, (list, tuple)) else [paths]
+    for candidate in candidates:
+        value = _path_value(mapping, candidate)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _current_env(env: Optional[Mapping[str, str]]) -> Mapping[str, str]:
     return env or os.environ
 
@@ -185,10 +260,6 @@ def _attribution_overrides_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]
             "environment": _clean_str(kwargs.get("environment")),
             "actor_id": _clean_str(kwargs.get("actor_id")),
             "actor_type": _clean_str(kwargs.get("actor_type")),
-            "developer_id": _clean_str(kwargs.get("developer_id")),
-            "cloud_account_id": _clean_str(kwargs.get("cloud_account_id")),
-            "cluster_id": _clean_str(kwargs.get("cluster_id")),
-            "repository_id": _clean_str(kwargs.get("repository_id")),
         }
     )
 
@@ -209,10 +280,6 @@ def _attribution_overrides(
     environment: Optional[str] = None,
     actor_id: Optional[str] = None,
     actor_type: Optional[str] = None,
-    developer_id: Optional[str] = None,
-    cloud_account_id: Optional[str] = None,
-    cluster_id: Optional[str] = None,
-    repository_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     return _attribution_overrides_from_kwargs(
         {
@@ -230,16 +297,187 @@ def _attribution_overrides(
             "environment": environment,
             "actor_id": actor_id,
             "actor_type": actor_type,
-            "developer_id": developer_id,
-            "cloud_account_id": cloud_account_id,
-            "cluster_id": cluster_id,
-            "repository_id": repository_id,
         }
     )
 
 
 def _merged_attribution(attribution: Optional[Dict[str, Any]], overrides: Dict[str, Any]) -> Dict[str, Any]:
     return _strip_none({**(attribution or {}), **overrides})
+
+
+def _current_attribution_context() -> Dict[str, Any]:
+    return dict(_ATTRIBUTION_CONTEXT.get() or {})
+
+
+def _resolve_attribution_context(
+    attribution: Optional[Dict[str, Any]] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _merged_attribution(
+        _current_attribution_context(),
+        _merged_attribution(attribution, overrides or {}),
+    )
+
+
+@contextmanager
+def with_attribution(
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Iterator[Dict[str, Any]]:
+    context_value = _resolve_attribution_context(attribution, _attribution_overrides_from_kwargs(kwargs))
+    token = _ATTRIBUTION_CONTEXT.set(context_value)
+    try:
+        yield context_value
+    finally:
+        _ATTRIBUTION_CONTEXT.reset(token)
+
+
+def run_with_attribution(
+    call: Callable[[], T],
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Any:
+    if not callable(call):
+        raise TypeError(
+            "run_with_attribution expects a zero-argument callable; "
+            "wrap awaitables as lambda: coroutine(...) instead of passing the awaitable directly"
+        )
+    context_value = _resolve_attribution_context(attribution, _attribution_overrides_from_kwargs(kwargs))
+    with with_attribution(context_value):
+        result = call()
+    if inspect.isasyncgen(result):
+        async def _iterate_async() -> AsyncIterator[Any]:
+            with with_attribution(context_value):
+                async for chunk in result:
+                    yield chunk
+        return _iterate_async()
+    if inspect.isgenerator(result):
+        def _iterate_sync() -> Iterator[Any]:
+            with with_attribution(context_value):
+                for chunk in result:
+                    yield chunk
+        return _iterate_sync()
+    if inspect.isawaitable(result):
+        async def _await_result() -> Any:
+            with with_attribution(context_value):
+                return await result
+        return _await_result()
+    return result
+
+
+def _named_context_attribution(
+    key: str,
+    name: Optional[str],
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    resolved = _resolve_attribution_context(attribution, _attribution_overrides_from_kwargs(kwargs))
+    resolved_name = _clean_str(name)
+    if resolved_name and not resolved.get(key):
+        resolved[key] = resolved_name
+    return resolved
+
+
+@contextmanager
+def with_workflow(
+    name: Optional[str] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Iterator[Dict[str, Any]]:
+    with with_attribution(_named_context_attribution("workflow_id", name, attribution, **kwargs)) as context_value:
+        yield context_value
+
+
+@contextmanager
+def with_task(
+    name: Optional[str] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Iterator[Dict[str, Any]]:
+    with with_attribution(_named_context_attribution("feature_id", name, attribution, **kwargs)) as context_value:
+        yield context_value
+
+
+def run_with_workflow(
+    call: Callable[[], T],
+    name: Optional[str] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Any:
+    return run_with_attribution(call, _named_context_attribution("workflow_id", name, attribution, **kwargs))
+
+
+def run_with_task(
+    call: Callable[[], T],
+    name: Optional[str] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Any:
+    return run_with_attribution(call, _named_context_attribution("feature_id", name, attribution, **kwargs))
+
+
+def workflow(
+    name: Optional[str] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def _decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def _async_wrapped(*args: Any, **inner_kwargs: Any) -> Any:
+                return await run_with_workflow(
+                    lambda: func(*args, **inner_kwargs),
+                    name=name,
+                    attribution=attribution,
+                    **kwargs,
+                )
+
+            return _async_wrapped
+
+        @functools.wraps(func)
+        def _wrapped(*args: Any, **inner_kwargs: Any) -> Any:
+            return run_with_workflow(
+                lambda: func(*args, **inner_kwargs),
+                name=name,
+                attribution=attribution,
+                **kwargs,
+            )
+
+        return _wrapped
+
+    return _decorate
+
+
+def task(
+    name: Optional[str] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def _decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def _async_wrapped(*args: Any, **inner_kwargs: Any) -> Any:
+                return await run_with_task(
+                    lambda: func(*args, **inner_kwargs),
+                    name=name,
+                    attribution=attribution,
+                    **kwargs,
+                )
+
+            return _async_wrapped
+
+        @functools.wraps(func)
+        def _wrapped(*args: Any, **inner_kwargs: Any) -> Any:
+            return run_with_task(
+                lambda: func(*args, **inner_kwargs),
+                name=name,
+                attribution=attribution,
+                **kwargs,
+            )
+
+        return _wrapped
+
+    return _decorate
 
 
 def _fallback_source_event_id() -> str:
@@ -270,6 +508,30 @@ def _clean_usage_map(values: Optional[Dict[str, Any]]) -> Dict[str, int]:
 
 def _strip_none(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def _has_meaningful_extraction(extracted: Mapping[str, Any]) -> bool:
+    return any(
+        key in extracted and extracted.get(key) is not None
+        for key in (
+            "provider",
+            "model",
+            "provider_request_id",
+            "request_id",
+            "trace_id",
+            "status",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "reasoning_tokens",
+            "cached_input_tokens",
+            "vendor_reported_cost_usd",
+            "latency_ms",
+            "cache_hit",
+            "metadata",
+            "extra_usage_units",
+        )
+    )
 
 
 def _clean_float(value: Any) -> Optional[float]:
@@ -321,10 +583,6 @@ def _attribution_dict(defaults: LLMAttribution, overrides: Dict[str, Any]) -> Di
         "environment": defaults.environment,
         "actor_id": defaults.actor_id,
         "actor_type": defaults.actor_type,
-        "developer_id": defaults.developer_id,
-        "cloud_account_id": defaults.cloud_account_id,
-        "cluster_id": defaults.cluster_id,
-        "repository_id": defaults.repository_id,
     }
     base.update({key: value for key, value in overrides.items() if value is not None})
     return _strip_none(base)
@@ -344,7 +602,7 @@ def _event_payload(
         total_tokens = (input_tokens or 0) + (output_tokens or 0)
 
     metadata = _sanitize_custom_metadata(event.metadata or {}, metadata_privacy_policy)
-    metadata.update(_attribution_dict(defaults, event.attribution or {}))
+    metadata.update(_attribution_dict(defaults, _resolve_attribution_context(event.attribution or {})))
     metadata.update(
         _strip_none(
             {
@@ -386,6 +644,48 @@ def _event_payload(
             "error_message": event.error_message,
             "metadata": metadata,
         }
+    )
+
+
+def _coerce_usage_event_input(event: Union[LLMUsageEvent, Mapping[str, Any]]) -> LLMUsageEvent:
+    if isinstance(event, LLMUsageEvent):
+        return event
+    mapping = _coerce_mapping(event)
+    if not mapping:
+        raise TypeError("Expected LLMUsageEvent or mapping-compatible event payload")
+    return LLMUsageEvent(
+        provider=_clean_str(mapping.get("provider")) or "",
+        model=_clean_str(mapping.get("model")) or "",
+        source_event_id=_clean_str(mapping.get("source_event_id")),
+        request_id=_clean_str(mapping.get("request_id")),
+        provider_request_id=_clean_str(mapping.get("provider_request_id")),
+        trace_id=_clean_str(mapping.get("trace_id")),
+        status=_clean_str(mapping.get("status")) or "succeeded",
+        input_tokens=_clean_int(mapping.get("input_tokens")),
+        output_tokens=_clean_int(mapping.get("output_tokens")),
+        total_tokens=_clean_int(mapping.get("total_tokens")),
+        reasoning_tokens=_clean_int(mapping.get("reasoning_tokens")),
+        cached_input_tokens=_clean_int(mapping.get("cached_input_tokens")),
+        extra_usage_units=_clean_usage_map(_coerce_mapping(mapping.get("extra_usage_units"))),
+        cache_hit=_clean_bool(mapping.get("cache_hit")),
+        vendor_reported_cost_usd=mapping.get("vendor_reported_cost_usd"),
+        started_at=mapping.get("started_at"),
+        completed_at=mapping.get("completed_at"),
+        latency_ms=_clean_int(mapping.get("latency_ms")),
+        error_message=_clean_str(mapping.get("error_message")),
+        agent_session_id=_clean_str(mapping.get("agent_session_id")),
+        agent_run_id=_clean_str(mapping.get("agent_run_id")),
+        parent_execution_id=_clean_str(mapping.get("parent_execution_id")),
+        agent_step_id=_clean_str(mapping.get("agent_step_id")),
+        tool_call_id=_clean_str(mapping.get("tool_call_id")),
+        tool_name=_clean_str(mapping.get("tool_name")),
+        retry_index=_clean_int(mapping.get("retry_index")),
+        loop_iteration=_clean_int(mapping.get("loop_iteration")),
+        attribution=_resolve_attribution_context(
+            _coerce_mapping(mapping.get("attribution")),
+            _attribution_overrides_from_kwargs(dict(mapping)),
+        ),
+        metadata=_coerce_mapping(mapping.get("metadata")),
     )
 
 
@@ -731,10 +1031,6 @@ def _preview_default_attribution(
         release=_clean_str(raw.get("release")),
         actor_id=_clean_str(raw.get("actor_id")),
         actor_type=_clean_str(raw.get("actor_type")),
-        developer_id=_clean_str(raw.get("developer_id")),
-        cloud_account_id=_clean_str(raw.get("cloud_account_id")),
-        cluster_id=_clean_str(raw.get("cluster_id")),
-        repository_id=_clean_str(raw.get("repository_id")),
     )
 
 
@@ -764,7 +1060,7 @@ def _validate_single_payload(payload: Dict[str, Any], prefix: str) -> List[str]:
 
 
 def preview_event_payload(
-    event: LLMUsageEvent,
+    event: Union[LLMUsageEvent, Mapping[str, Any]],
     *,
     default_attribution: Optional[Union[LLMAttribution, Dict[str, Any]]] = None,
     sdk_name: str = "cloptima-llm-observability",
@@ -772,7 +1068,7 @@ def preview_event_payload(
     metadata_policy: Optional[Union[MetadataPrivacyPolicy, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     return _event_payload(
-        event,
+        _coerce_usage_event_input(event),
         _preview_default_attribution(default_attribution),
         sdk_name,
         _resolve_metadata_privacy_policy(metadata_policy),
@@ -781,7 +1077,7 @@ def preview_event_payload(
 
 
 def preview_batch_payload(
-    events: List[LLMUsageEvent],
+    events: List[Union[LLMUsageEvent, Mapping[str, Any]]],
     *,
     default_attribution: Optional[Union[LLMAttribution, Dict[str, Any]]] = None,
     sdk_name: str = "cloptima-llm-observability",
@@ -801,6 +1097,415 @@ def preview_batch_payload(
     if len(payloads) == 1:
         return payloads[0]
     return {"schema_version": SDK_BATCH_SCHEMA_VERSION, "events": payloads}
+
+
+def try_extract_usage(input_value: Any, *extractors: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
+    for extractor in extractors:
+        if extractor is None:
+            continue
+        try:
+            extracted = extractor(input_value) or {}
+        except Exception:
+            continue
+        if _has_meaningful_extraction(extracted):
+            return _strip_none(dict(extracted))
+    return {}
+
+
+def compose_usage_extractors(*extractors: Callable[[Any], Dict[str, Any]]) -> Callable[[Any], Dict[str, Any]]:
+    def _composed(input_value: Any) -> Dict[str, Any]:
+        return try_extract_usage(input_value, *extractors)
+
+    return _composed
+
+
+def with_usage_overrides(
+    extractor: Callable[[Any], Dict[str, Any]],
+    overrides: Union[Dict[str, Any], Callable[[Dict[str, Any], Any], Dict[str, Any]]],
+) -> Callable[[Any], Dict[str, Any]]:
+    def _wrapped(input_value: Any) -> Dict[str, Any]:
+        extracted = extractor(input_value) or {}
+        override_values = overrides(extracted, input_value) if callable(overrides) else overrides
+        return _strip_none({**extracted, **(override_values or {})})
+
+    return _wrapped
+
+
+def create_mapped_usage_extractor(
+    *,
+    defaults: Optional[Dict[str, Any]] = None,
+    fields: Optional[Dict[str, Union[str, List[str], Tuple[str, ...]]]] = None,
+    number_fields: Optional[Dict[str, Union[str, List[str], Tuple[str, ...]]]] = None,
+    boolean_fields: Optional[Dict[str, Union[str, List[str], Tuple[str, ...]]]] = None,
+    extra_usage_units: Optional[Dict[str, Union[str, List[str], Tuple[str, ...]]]] = None,
+    metadata: Optional[Dict[str, Union[str, List[str], Tuple[str, ...]]]] = None,
+) -> UsageExtractor:
+    def _extract(input_value: Any) -> Dict[str, Any]:
+        record = _coerce_mapping(input_value)
+        extracted: Dict[str, Any] = dict(defaults or {})
+        for key, path in (fields or {}).items():
+            value = _resolve_mapped_value(record, path)
+            if key == "vendor_reported_cost_usd":
+                extracted[key] = _clean_float(value) if _clean_float(value) is not None else _clean_str(value)
+            else:
+                extracted[key] = _clean_str(value)
+        for key, path in (number_fields or {}).items():
+            extracted[key] = _clean_int(_resolve_mapped_value(record, path))
+        for key, path in (boolean_fields or {}).items():
+            if key == "cache_hit":
+                extracted[key] = _clean_bool(_resolve_mapped_value(record, path))
+        if extra_usage_units:
+            extracted["extra_usage_units"] = _clean_usage_map(
+                {key: _resolve_mapped_value(record, path) for key, path in extra_usage_units.items()}
+            ) or None
+        if metadata:
+            extracted["metadata"] = _strip_none(
+                {key: _resolve_mapped_value(record, path) for key, path in metadata.items()}
+            ) or None
+        if extracted.get("total_tokens") is None and (
+            extracted.get("input_tokens") is not None or extracted.get("output_tokens") is not None
+        ):
+            extracted["total_tokens"] = (extracted.get("input_tokens") or 0) + (extracted.get("output_tokens") or 0)
+        return _strip_none(extracted)
+
+    return _extract
+
+
+def _merge_optional_dicts(*values: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    merged: Dict[str, Any] = {}
+    for value in values:
+        if value:
+            merged.update(value)
+    return merged or None
+
+
+def create_observed_call(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = True,
+) -> Callable[..., Any]:
+    def _invoke(call: Callable[[], Any], **overrides: Any) -> Any:
+        return client.observe(
+            provider=overrides.get("provider") or provider,
+            model=overrides.get("model") or model,
+            call=call,
+            extract_usage=overrides.get("extract_usage") or extract_usage,
+            attribution=_merge_optional_dicts(attribution, overrides.get("attribution")),
+            agent=_merge_optional_dicts(agent, overrides.get("agent")),
+            metadata=_merge_optional_dicts(metadata, overrides.get("metadata")),
+            metadata_policy=overrides.get("metadata_policy", metadata_policy),
+            request_id=overrides.get("request_id") or request_id,
+            trace_id=overrides.get("trace_id") or trace_id,
+            fire_and_forget=overrides.get("fire_and_forget", fire_and_forget),
+        )
+
+    return _invoke
+
+
+def create_observed_async_call(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = True,
+) -> Callable[..., Any]:
+    async def _invoke(call: Callable[[], Any], **overrides: Any) -> Any:
+        return await client.observe_async(
+            provider=overrides.get("provider") or provider,
+            model=overrides.get("model") or model,
+            call=call,
+            extract_usage=overrides.get("extract_usage") or extract_usage,
+            attribution=_merge_optional_dicts(attribution, overrides.get("attribution")),
+            agent=_merge_optional_dicts(agent, overrides.get("agent")),
+            metadata=_merge_optional_dicts(metadata, overrides.get("metadata")),
+            metadata_policy=overrides.get("metadata_policy", metadata_policy),
+            request_id=overrides.get("request_id") or request_id,
+            trace_id=overrides.get("trace_id") or trace_id,
+            fire_and_forget=overrides.get("fire_and_forget", fire_and_forget),
+        )
+
+    return _invoke
+
+
+def create_observed_stream(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[List[Any]], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = False,
+    max_buffered_chunks: int = 256,
+) -> Callable[..., Iterator[Any]]:
+    def _invoke(call: Callable[[], Iterable[Any]], **overrides: Any) -> Iterator[Any]:
+        return client.observe_stream(
+            provider=overrides.get("provider") or provider,
+            model=overrides.get("model") or model,
+            call=call,
+            extract_usage=overrides.get("extract_usage") or extract_usage,
+            attribution=_merge_optional_dicts(attribution, overrides.get("attribution")),
+            agent=_merge_optional_dicts(agent, overrides.get("agent")),
+            metadata=_merge_optional_dicts(metadata, overrides.get("metadata")),
+            metadata_policy=overrides.get("metadata_policy", metadata_policy),
+            request_id=overrides.get("request_id") or request_id,
+            trace_id=overrides.get("trace_id") or trace_id,
+            fire_and_forget=overrides.get("fire_and_forget", fire_and_forget),
+            max_buffered_chunks=overrides.get("max_buffered_chunks", max_buffered_chunks),
+        )
+
+    return _invoke
+
+
+def create_observed_async_stream(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[List[Any]], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = False,
+    max_buffered_chunks: int = 256,
+) -> Callable[..., AsyncIterator[Any]]:
+    def _invoke(call: Callable[[], Any], **overrides: Any) -> AsyncIterator[Any]:
+        return client.observe_async_stream(
+            provider=overrides.get("provider") or provider,
+            model=overrides.get("model") or model,
+            call=call,
+            extract_usage=overrides.get("extract_usage") or extract_usage,
+            attribution=_merge_optional_dicts(attribution, overrides.get("attribution")),
+            agent=_merge_optional_dicts(agent, overrides.get("agent")),
+            metadata=_merge_optional_dicts(metadata, overrides.get("metadata")),
+            metadata_policy=overrides.get("metadata_policy", metadata_policy),
+            request_id=overrides.get("request_id") or request_id,
+            trace_id=overrides.get("trace_id") or trace_id,
+            fire_and_forget=overrides.get("fire_and_forget", fire_and_forget),
+            max_buffered_chunks=overrides.get("max_buffered_chunks", max_buffered_chunks),
+        )
+
+    return _invoke
+
+
+def bind_observed_call(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    method: Callable[..., Any],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = True,
+    resolve_overrides: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Callable[..., Any]:
+    observed = create_observed_call(
+        client,
+        provider=provider,
+        model=model,
+        extract_usage=extract_usage,
+        attribution=attribution,
+        agent=agent,
+        metadata=metadata,
+        metadata_policy=metadata_policy,
+        request_id=request_id,
+        trace_id=trace_id,
+        fire_and_forget=fire_and_forget,
+    )
+
+    @functools.wraps(method)
+    def _invoke(*args: Any, **kwargs: Any) -> Any:
+        overrides = resolve_overrides(*args, **kwargs) if resolve_overrides else {}
+        return observed(lambda: method(*args, **kwargs), **overrides)
+
+    return _invoke
+
+
+def bind_observed_async_call(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    method: Callable[..., Any],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = True,
+    resolve_overrides: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Callable[..., Any]:
+    observed = create_observed_async_call(
+        client,
+        provider=provider,
+        model=model,
+        extract_usage=extract_usage,
+        attribution=attribution,
+        agent=agent,
+        metadata=metadata,
+        metadata_policy=metadata_policy,
+        request_id=request_id,
+        trace_id=trace_id,
+        fire_and_forget=fire_and_forget,
+    )
+
+    @functools.wraps(method)
+    async def _invoke(*args: Any, **kwargs: Any) -> Any:
+        overrides = resolve_overrides(*args, **kwargs) if resolve_overrides else {}
+        return await observed(lambda: method(*args, **kwargs), **overrides)
+
+    return _invoke
+
+
+def bind_observed_stream(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    method: Callable[..., Iterable[Any]],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[List[Any]], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = False,
+    max_buffered_chunks: int = 256,
+    resolve_overrides: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Callable[..., Iterator[Any]]:
+    observed = create_observed_stream(
+        client,
+        provider=provider,
+        model=model,
+        extract_usage=extract_usage,
+        attribution=attribution,
+        agent=agent,
+        metadata=metadata,
+        metadata_policy=metadata_policy,
+        request_id=request_id,
+        trace_id=trace_id,
+        fire_and_forget=fire_and_forget,
+        max_buffered_chunks=max_buffered_chunks,
+    )
+
+    @functools.wraps(method)
+    def _invoke(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        overrides = resolve_overrides(*args, **kwargs) if resolve_overrides else {}
+        return observed(lambda: method(*args, **kwargs), **overrides)
+
+    return _invoke
+
+
+def bind_observed_async_stream(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    method: Callable[..., Any],
+    *,
+    provider: str,
+    model: str,
+    extract_usage: Optional[Callable[[List[Any]], Dict[str, Any]]] = None,
+    attribution: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    metadata_policy: Optional[Union["MetadataPrivacyPolicy", Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    fire_and_forget: bool = False,
+    max_buffered_chunks: int = 256,
+    resolve_overrides: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Callable[..., AsyncIterator[Any]]:
+    observed = create_observed_async_stream(
+        client,
+        provider=provider,
+        model=model,
+        extract_usage=extract_usage,
+        attribution=attribution,
+        agent=agent,
+        metadata=metadata,
+        metadata_policy=metadata_policy,
+        request_id=request_id,
+        trace_id=trace_id,
+        fire_and_forget=fire_and_forget,
+        max_buffered_chunks=max_buffered_chunks,
+    )
+
+    @functools.wraps(method)
+    def _invoke(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        overrides = resolve_overrides(*args, **kwargs) if resolve_overrides else {}
+        return observed(lambda: method(*args, **kwargs), **overrides)
+
+    return _invoke
+
+
+def wrap_observed_service(
+    client: Union["CloptimaLLMObservability", "DisabledCloptimaLLMObservability"],
+    service: Any,
+    bindings: Dict[str, Dict[str, Any]],
+) -> Any:
+    class _WrappedService:
+        def __init__(self, original_service: Any) -> None:
+            object.__setattr__(self, "_original_service", original_service)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(object.__getattribute__(self, "_original_service"), name)
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            object.__setattr__(self, name, value)
+
+        def __dir__(self) -> List[str]:
+            original = object.__getattribute__(self, "_original_service")
+            return sorted(set(object.__dir__(self) + dir(original)))
+
+    wrapped = _WrappedService(service)
+    for method_name, binding in bindings.items():
+        original = getattr(service, method_name, None)
+        if not callable(original):
+            raise ValueError(f"Cannot wrap non-callable service method: {method_name}")
+        kind = binding.get("kind")
+        options = dict(binding.get("options") or {})
+        resolve_overrides = binding.get("resolve_overrides")
+        if kind == "call":
+            wrapped_method = bind_observed_call(client, original, resolve_overrides=resolve_overrides, **options)
+        elif kind == "async_call":
+            wrapped_method = bind_observed_async_call(client, original, resolve_overrides=resolve_overrides, **options)
+        elif kind == "stream":
+            wrapped_method = bind_observed_stream(client, original, resolve_overrides=resolve_overrides, **options)
+        elif kind == "async_stream":
+            wrapped_method = bind_observed_async_stream(client, original, resolve_overrides=resolve_overrides, **options)
+        else:
+            raise ValueError(f"Unsupported observed service binding kind: {kind}")
+        setattr(wrapped, method_name, wrapped_method)
+    return wrapped
 
 
 def preview_otlp_request(
@@ -895,6 +1600,55 @@ class CloptimaLLMObservability:
 
     def get_init_error(self) -> Optional[BaseException]:
         return None
+
+    def run_with_attribution(
+        self,
+        call: Callable[[], T],
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return run_with_attribution(call, attribution, **kwargs)
+
+    def with_attribution(
+        self,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Dict[str, Any]]:
+        return with_attribution(attribution, **kwargs)
+
+    def run_with_workflow(
+        self,
+        call: Callable[[], T],
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return run_with_workflow(call, name=name, attribution=attribution, **kwargs)
+
+    def with_workflow(
+        self,
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Dict[str, Any]]:
+        return with_workflow(name=name, attribution=attribution, **kwargs)
+
+    def run_with_task(
+        self,
+        call: Callable[[], T],
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return run_with_task(call, name=name, attribution=attribution, **kwargs)
+
+    def with_task(
+        self,
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Dict[str, Any]]:
+        return with_task(name=name, attribution=attribution, **kwargs)
 
     def _otlp_request_headers(self) -> Dict[str, str]:
         headers = {
@@ -1573,10 +2327,6 @@ class CloptimaLLMObservability:
         environment: Optional[str] = None,
         actor_id: Optional[str] = None,
         actor_type: Optional[str] = None,
-        developer_id: Optional[str] = None,
-        cloud_account_id: Optional[str] = None,
-        cluster_id: Optional[str] = None,
-        repository_id: Optional[str] = None,
     ) -> T:
         attribution_overrides = _attribution_overrides(
             team_id=team_id,
@@ -1593,10 +2343,6 @@ class CloptimaLLMObservability:
             environment=environment,
             actor_id=actor_id,
             actor_type=actor_type,
-            developer_id=developer_id,
-            cloud_account_id=cloud_account_id,
-            cluster_id=cluster_id,
-            repository_id=repository_id,
         )
         return self.observe(
             provider=provider,
@@ -1640,10 +2386,6 @@ class CloptimaLLMObservability:
         environment: Optional[str] = None,
         actor_id: Optional[str] = None,
         actor_type: Optional[str] = None,
-        developer_id: Optional[str] = None,
-        cloud_account_id: Optional[str] = None,
-        cluster_id: Optional[str] = None,
-        repository_id: Optional[str] = None,
     ) -> Any:
         attribution_overrides = _attribution_overrides(
             team_id=team_id,
@@ -1660,10 +2402,6 @@ class CloptimaLLMObservability:
             environment=environment,
             actor_id=actor_id,
             actor_type=actor_type,
-            developer_id=developer_id,
-            cloud_account_id=cloud_account_id,
-            cluster_id=cluster_id,
-            repository_id=repository_id,
         )
         return await self.observe_async(
             provider=provider,
@@ -1708,10 +2446,6 @@ class CloptimaLLMObservability:
         environment: Optional[str] = None,
         actor_id: Optional[str] = None,
         actor_type: Optional[str] = None,
-        developer_id: Optional[str] = None,
-        cloud_account_id: Optional[str] = None,
-        cluster_id: Optional[str] = None,
-        repository_id: Optional[str] = None,
     ) -> Iterator[T]:
         attribution_overrides = _attribution_overrides(
             team_id=team_id,
@@ -1728,10 +2462,6 @@ class CloptimaLLMObservability:
             environment=environment,
             actor_id=actor_id,
             actor_type=actor_type,
-            developer_id=developer_id,
-            cloud_account_id=cloud_account_id,
-            cluster_id=cluster_id,
-            repository_id=repository_id,
         )
         return self.observe_stream(
             provider=provider,
@@ -1777,10 +2507,6 @@ class CloptimaLLMObservability:
         environment: Optional[str] = None,
         actor_id: Optional[str] = None,
         actor_type: Optional[str] = None,
-        developer_id: Optional[str] = None,
-        cloud_account_id: Optional[str] = None,
-        cluster_id: Optional[str] = None,
-        repository_id: Optional[str] = None,
     ) -> AsyncIterator[T]:
         attribution_overrides = _attribution_overrides(
             team_id=team_id,
@@ -1797,10 +2523,6 @@ class CloptimaLLMObservability:
             environment=environment,
             actor_id=actor_id,
             actor_type=actor_type,
-            developer_id=developer_id,
-            cloud_account_id=cloud_account_id,
-            cluster_id=cluster_id,
-            repository_id=repository_id,
         )
         async for chunk in self.observe_async_stream(
             provider=provider,
@@ -1828,6 +2550,55 @@ class DisabledCloptimaLLMObservability:
 
     def get_init_error(self) -> Optional[BaseException]:
         return self._init_error
+
+    def run_with_attribution(
+        self,
+        call: Callable[[], T],
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return run_with_attribution(call, attribution, **kwargs)
+
+    def with_attribution(
+        self,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Dict[str, Any]]:
+        return with_attribution(attribution, **kwargs)
+
+    def run_with_workflow(
+        self,
+        call: Callable[[], T],
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return run_with_workflow(call, name=name, attribution=attribution, **kwargs)
+
+    def with_workflow(
+        self,
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Dict[str, Any]]:
+        return with_workflow(name=name, attribution=attribution, **kwargs)
+
+    def run_with_task(
+        self,
+        call: Callable[[], T],
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return run_with_task(call, name=name, attribution=attribution, **kwargs)
+
+    def with_task(
+        self,
+        name: Optional[str] = None,
+        attribution: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Dict[str, Any]]:
+        return with_task(name=name, attribution=attribution, **kwargs)
 
     def record(self, event: LLMUsageEvent) -> None:
         return None
@@ -2168,10 +2939,6 @@ def init_from_env(
             release=_clean_str(attribution_values.get("release")),
             actor_id=_clean_str(attribution_values.get("actor_id")),
             actor_type=_clean_str(attribution_values.get("actor_type")),
-            developer_id=_clean_str(attribution_values.get("developer_id")),
-            cloud_account_id=_clean_str(attribution_values.get("cloud_account_id")),
-            cluster_id=_clean_str(attribution_values.get("cluster_id")),
-            repository_id=_clean_str(attribution_values.get("repository_id")),
         ),
         delivery_mode=delivery_mode or _clean_str(current_env.get(INIT_DELIVERY_MODE_ENV)) or "cloptima_http",
         otlp_headers=otlp_headers,
@@ -2193,16 +2960,17 @@ def init_from_env(
     )
 
 
-def extract_openai_usage(response: Dict[str, Any]) -> Dict[str, Any]:
-    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
-    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
-    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+def extract_openai_usage(response: Any) -> Dict[str, Any]:
+    record = _coerce_mapping(response)
+    usage = _nested_mapping(record, "usage")
+    prompt_details = _nested_mapping(usage, "prompt_tokens_details", "promptTokensDetails")
+    completion_details = _nested_mapping(usage, "completion_tokens_details", "completionTokensDetails")
     cached_tokens = _clean_int(prompt_details.get("cached_tokens"))
     return _strip_none(
         {
             "provider": "openai",
-            "provider_request_id": response.get("id"),
-            "model": response.get("model"),
+            "provider_request_id": _mapping_field(record, "id"),
+            "model": _mapping_field(record, "model"),
             "input_tokens": _clean_int(usage.get("prompt_tokens")),
             "output_tokens": _clean_int(usage.get("completion_tokens")),
             "total_tokens": _clean_int(usage.get("total_tokens")),
@@ -2220,17 +2988,18 @@ def extract_openai_usage(response: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def extract_openai_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_openai_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     last_with_usage: Dict[str, Any] = {}
     last_id = None
     last_model = None
     for chunk in chunks:
-        if not isinstance(chunk, dict):
+        record = _coerce_mapping(chunk)
+        if not record:
             continue
-        last_id = chunk.get("id") or last_id
-        last_model = chunk.get("model") or last_model
-        if isinstance(chunk.get("usage"), dict):
-            last_with_usage = chunk
+        last_id = _mapping_field(record, "id") or last_id
+        last_model = _mapping_field(record, "model") or last_model
+        if _nested_mapping(record, "usage"):
+            last_with_usage = record
     if not last_with_usage:
         return _strip_none({"provider_request_id": last_id, "model": last_model})
     extracted = extract_openai_usage(last_with_usage)
@@ -2241,16 +3010,18 @@ def extract_openai_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, A
     return _strip_none(extracted)
 
 
-def extract_azure_openai_usage(response: Dict[str, Any]) -> Dict[str, Any]:
+def extract_azure_openai_usage(response: Any) -> Dict[str, Any]:
+    record = _coerce_mapping(response)
     extracted = extract_openai_usage(response)
     extracted["provider"] = "azure_openai"
     if not extracted.get("model"):
-        extracted["model"] = response.get("deployment_name") or response.get("deployment") or response.get("model")
+        extracted["model"] = _mapping_field(record, "deployment_name", "deployment", "model")
     return _strip_none(extracted)
 
 
-def extract_anthropic_usage(response: Dict[str, Any]) -> Dict[str, Any]:
-    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+def extract_anthropic_usage(response: Any) -> Dict[str, Any]:
+    record = _coerce_mapping(response)
+    usage = _nested_mapping(record, "usage")
     input_tokens = _clean_int(usage.get("input_tokens"))
     output_tokens = _clean_int(usage.get("output_tokens"))
     cache_read_tokens = _clean_int(usage.get("cache_read_input_tokens"))
@@ -2265,8 +3036,8 @@ def extract_anthropic_usage(response: Dict[str, Any]) -> Dict[str, Any]:
     return _strip_none(
         {
             "provider": "anthropic",
-            "provider_request_id": response.get("id"),
-            "model": response.get("model"),
+            "provider_request_id": _mapping_field(record, "id"),
+            "model": _mapping_field(record, "model"),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": _clean_int(usage.get("total_tokens")) or (
@@ -2281,7 +3052,7 @@ def extract_anthropic_usage(response: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def extract_anthropic_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_anthropic_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     message_id = None
     model = None
     input_tokens = None
@@ -2289,15 +3060,16 @@ def extract_anthropic_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str
     cache_read_tokens = None
     cache_write_tokens = None
     for chunk in chunks:
-        if not isinstance(chunk, dict):
+        record = _coerce_mapping(chunk)
+        if not record:
             continue
-        if isinstance(chunk.get("message"), dict):
-            message = chunk["message"]
-            message_id = message.get("id") or message_id
-            model = message.get("model") or model
-            usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+        message = _nested_mapping(record, "message")
+        if message:
+            message_id = _mapping_field(message, "id") or message_id
+            model = _mapping_field(message, "model") or model
+            usage = _nested_mapping(message, "usage")
         else:
-            usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else {}
+            usage = _nested_mapping(record, "usage")
         input_tokens = _clean_int(usage.get("input_tokens")) or input_tokens
         output_tokens = _clean_int(usage.get("output_tokens")) or output_tokens
         cache_read_tokens = _clean_int(usage.get("cache_read_input_tokens")) or cache_read_tokens
@@ -2320,43 +3092,43 @@ def extract_anthropic_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str
     )
 
 
-def extract_gemini_usage(response: Dict[str, Any]) -> Dict[str, Any]:
-    usage = response.get("usageMetadata") if isinstance(response.get("usageMetadata"), dict) else {}
-    if not usage:
-        usage = response.get("usage_metadata") if isinstance(response.get("usage_metadata"), dict) else {}
-    cached_tokens = _clean_int(usage.get("cachedContentTokenCount") or usage.get("cached_content_token_count"))
+def extract_gemini_usage(response: Any) -> Dict[str, Any]:
+    record = _coerce_mapping(response)
+    usage = _nested_mapping(record, "usageMetadata", "usage_metadata")
+    cached_tokens = _clean_int(_mapping_field(usage, "cachedContentTokenCount", "cached_content_token_count"))
     return _strip_none(
         {
-            "provider": response.get("provider") or "gemini",
-            "provider_request_id": response.get("responseId") or response.get("response_id") or response.get("id") or response.get("name"),
-            "model": response.get("modelVersion") or response.get("model_version") or response.get("model"),
-            "input_tokens": _clean_int(usage.get("promptTokenCount") or usage.get("prompt_token_count")),
-            "output_tokens": _clean_int(usage.get("candidatesTokenCount") or usage.get("candidates_token_count")),
-            "total_tokens": _clean_int(usage.get("totalTokenCount") or usage.get("total_token_count")),
-            "reasoning_tokens": _clean_int(usage.get("thoughtsTokenCount") or usage.get("thoughts_token_count")),
+            "provider": _mapping_field(record, "provider") or "gemini",
+            "provider_request_id": _mapping_field(record, "responseId", "response_id", "id", "name"),
+            "model": _mapping_field(record, "modelVersion", "model_version", "model"),
+            "input_tokens": _clean_int(_mapping_field(usage, "promptTokenCount", "prompt_token_count", "inputTokenCount", "input_token_count")),
+            "output_tokens": _clean_int(_mapping_field(usage, "responseTokenCount", "response_token_count", "candidatesTokenCount", "candidates_token_count", "outputTokenCount", "output_token_count")),
+            "total_tokens": _clean_int(_mapping_field(usage, "totalTokenCount", "total_token_count")),
+            "reasoning_tokens": _clean_int(_mapping_field(usage, "thoughtsTokenCount", "thoughts_token_count", "reasoningTokenCount", "reasoning_token_count")),
             "cached_input_tokens": cached_tokens,
             "cache_hit": True if cached_tokens else None,
         }
     )
 
 
-def extract_vertex_usage(response: Dict[str, Any]) -> Dict[str, Any]:
+def extract_vertex_usage(response: Any) -> Dict[str, Any]:
     extracted = extract_gemini_usage(response)
     extracted["provider"] = "vertex_ai"
     return _strip_none(extracted)
 
 
-def extract_gemini_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_gemini_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     last_with_usage: Dict[str, Any] = {}
     last_id = None
     last_model = None
     for chunk in chunks:
-        if not isinstance(chunk, dict):
+        record = _coerce_mapping(chunk)
+        if not record:
             continue
-        last_id = chunk.get("responseId") or chunk.get("response_id") or chunk.get("id") or chunk.get("name") or last_id
-        last_model = chunk.get("modelVersion") or chunk.get("model_version") or chunk.get("model") or last_model
-        if isinstance(chunk.get("usageMetadata"), dict) or isinstance(chunk.get("usage_metadata"), dict):
-            last_with_usage = chunk
+        last_id = _mapping_field(record, "responseId", "response_id", "id", "name") or last_id
+        last_model = _mapping_field(record, "modelVersion", "model_version", "model") or last_model
+        if _nested_mapping(record, "usageMetadata", "usage_metadata"):
+            last_with_usage = record
     if not last_with_usage:
         return _strip_none({"provider": "gemini", "provider_request_id": last_id, "model": last_model})
     extracted = extract_gemini_usage(last_with_usage)
@@ -2367,30 +3139,31 @@ def extract_gemini_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, A
     return _strip_none(extracted)
 
 
-def extract_vertex_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_vertex_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     extracted = extract_gemini_stream_usage(chunks)
     extracted["provider"] = "vertex_ai"
     return _strip_none(extracted)
 
 
-def extract_bedrock_usage(response: Dict[str, Any]) -> Dict[str, Any]:
-    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
-    metrics = response.get("metrics") if isinstance(response.get("metrics"), dict) else {}
-    metadata = response.get("ResponseMetadata") if isinstance(response.get("ResponseMetadata"), dict) else {}
+def extract_bedrock_usage(response: Any) -> Dict[str, Any]:
+    record = _coerce_mapping(response)
+    usage = _nested_mapping(record, "usage")
+    metrics = _nested_mapping(record, "metrics")
+    metadata = _nested_mapping(record, "ResponseMetadata")
     return _strip_none(
         {
             "provider": "bedrock",
-            "provider_request_id": response.get("requestId") or response.get("request_id") or metadata.get("RequestId"),
-            "model": response.get("modelId") or response.get("model_id") or response.get("model"),
-            "input_tokens": _clean_int(usage.get("inputTokens") or usage.get("input_tokens")),
-            "output_tokens": _clean_int(usage.get("outputTokens") or usage.get("output_tokens")),
-            "total_tokens": _clean_int(usage.get("totalTokens") or usage.get("total_tokens")),
-            "latency_ms": _clean_int(metrics.get("latencyMs") or metrics.get("latency_ms")),
+            "provider_request_id": _mapping_field(record, "requestId", "request_id") or _mapping_field(metadata, "RequestId"),
+            "model": _mapping_field(record, "modelId", "model_id", "model"),
+            "input_tokens": _clean_int(_mapping_field(usage, "inputTokens", "input_tokens")),
+            "output_tokens": _clean_int(_mapping_field(usage, "outputTokens", "output_tokens")),
+            "total_tokens": _clean_int(_mapping_field(usage, "totalTokens", "total_tokens")),
+            "latency_ms": _clean_int(_mapping_field(metrics, "latencyMs", "latency_ms")),
         }
     )
 
 
-def extract_bedrock_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_bedrock_stream_usage(chunks: Iterable[Any]) -> Dict[str, Any]:
     """Aggregate Amazon Bedrock streaming usage deltas across chunks."""
     request_id = None
     model = None
@@ -2399,16 +3172,17 @@ def extract_bedrock_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, 
     total_tokens = None
     saw_usage = False
     for chunk in chunks:
-        if not isinstance(chunk, dict):
+        record = _coerce_mapping(chunk)
+        if not record:
             continue
-        request_id = chunk.get("requestId") or chunk.get("request_id") or request_id
-        model = chunk.get("modelId") or chunk.get("model_id") or chunk.get("model") or model
-        usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else None
+        request_id = _mapping_field(record, "requestId", "request_id") or request_id
+        model = _mapping_field(record, "modelId", "model_id", "model") or model
+        usage = _nested_mapping(record, "usage")
         if not usage:
             continue
-        input_count = _clean_int(usage.get("inputTokens") or usage.get("input_tokens"))
-        output_count = _clean_int(usage.get("outputTokens") or usage.get("output_tokens"))
-        total_count = _clean_int(usage.get("totalTokens") or usage.get("total_tokens"))
+        input_count = _clean_int(_mapping_field(usage, "inputTokens", "input_tokens"))
+        output_count = _clean_int(_mapping_field(usage, "outputTokens", "output_tokens"))
+        total_count = _clean_int(_mapping_field(usage, "totalTokens", "total_tokens"))
         if input_count is not None:
             input_tokens += input_count
             saw_usage = True
@@ -2426,6 +3200,110 @@ def extract_bedrock_stream_usage(chunks: Iterable[Dict[str, Any]]) -> Dict[str, 
             "total_tokens": total_tokens if total_tokens is not None else (input_tokens + output_tokens if saw_usage else None),
         }
     )
+
+
+PROVIDER_USAGE_EXTRACTORS = (
+    MappingProxyType(
+        {
+            "provider": "openai",
+            "aliases": ("openai",),
+            "response_extractor": extract_openai_usage,
+            "stream_extractor": extract_openai_stream_usage,
+        }
+    ),
+    MappingProxyType(
+        {
+            "provider": "azure_openai",
+            "aliases": ("azure_openai", "azure-openai", "azure"),
+            "response_extractor": extract_azure_openai_usage,
+            "stream_extractor": lambda chunks: _strip_none(
+                {
+                    **extract_openai_stream_usage(chunks),
+                    "provider": "azure_openai",
+                }
+            ),
+        }
+    ),
+    MappingProxyType(
+        {
+            "provider": "anthropic",
+            "aliases": ("anthropic",),
+            "response_extractor": extract_anthropic_usage,
+            "stream_extractor": extract_anthropic_stream_usage,
+        }
+    ),
+    MappingProxyType(
+        {
+            "provider": "gemini",
+            "aliases": ("gemini",),
+            "response_extractor": extract_gemini_usage,
+            "stream_extractor": extract_gemini_stream_usage,
+        }
+    ),
+    MappingProxyType(
+        {
+            "provider": "vertex_ai",
+            "aliases": ("vertex_ai", "vertex-ai", "vertex"),
+            "response_extractor": extract_vertex_usage,
+            "stream_extractor": extract_vertex_stream_usage,
+        }
+    ),
+    MappingProxyType(
+        {
+            "provider": "bedrock",
+            "aliases": ("bedrock",),
+            "response_extractor": extract_bedrock_usage,
+            "stream_extractor": extract_bedrock_stream_usage,
+        }
+    ),
+)
+
+
+PROVIDER_SUPPORT_MATRIX = tuple(
+    MappingProxyType(
+        {
+            "provider": descriptor["provider"],
+            "aliases": tuple(descriptor["aliases"]),
+            "response": True,
+            "stream": descriptor.get("stream_extractor") is not None,
+        }
+    )
+    for descriptor in PROVIDER_USAGE_EXTRACTORS
+)
+
+
+def get_provider_usage_extractor(provider: Optional[str]) -> Optional[UsageExtractor]:
+    normalized = _clean_str(provider or "")
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    for descriptor in PROVIDER_USAGE_EXTRACTORS:
+        if lowered in descriptor["aliases"]:
+            return descriptor["response_extractor"]
+    return None
+
+
+def get_provider_stream_usage_extractor(provider: Optional[str]) -> Optional[UsageExtractor]:
+    normalized = _clean_str(provider or "")
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    for descriptor in PROVIDER_USAGE_EXTRACTORS:
+        if lowered in descriptor["aliases"]:
+            return descriptor.get("stream_extractor")
+    return None
+
+
+def list_supported_providers() -> List[Dict[str, Any]]:
+    return [
+        {
+            "provider": descriptor["provider"],
+            "aliases": list(descriptor["aliases"]),
+            "response": descriptor["response"],
+            "stream": descriptor["stream"],
+        }
+        for descriptor in PROVIDER_SUPPORT_MATRIX
+    ]
 
 
 def _normalize_openai_compatible_provider(provider: Optional[str]) -> str:
@@ -2747,23 +3625,7 @@ def instrument_httpx_transport_metadata(
 
 
 def _select_provider_response_extractor(provider: Optional[str]) -> Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]:
-    normalized = _clean_str(provider or "")
-    if not normalized:
-        return extract_openai_usage
-    lowered = normalized.lower()
-    if lowered in {"azure", "azure-openai", "azure_openai"}:
-        return extract_azure_openai_usage
-    if lowered == "anthropic":
-        return extract_anthropic_usage
-    if lowered == "gemini":
-        return extract_gemini_usage
-    if lowered in {"vertex", "vertex_ai", "vertex-ai"}:
-        return extract_vertex_usage
-    if lowered == "bedrock":
-        return extract_bedrock_usage
-    if lowered == "openai":
-        return extract_openai_usage
-    return None
+    return get_provider_usage_extractor(provider)
 
 
 def _httpx_response_json(response: Any) -> Tuple[Optional[Dict[str, Any]], bool]:

@@ -43,7 +43,7 @@ def main() -> None:
                 "modelVersion": "gemini-2.5-pro",
                 "usageMetadata": {
                     "promptTokenCount": 6,
-                    "candidatesTokenCount": 3,
+                    "responseTokenCount": 3,
                     "totalTokenCount": 9,
                 },
             },

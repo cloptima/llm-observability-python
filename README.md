@@ -2,7 +2,7 @@
 
 Capture LLM usage telemetry from your application and send it to Cloptima for cost reporting, attribution, and analytics.
 
-Use this SDK when you want visibility into LLM usage without replacing your existing provider clients, retry policies, authentication, or application-level security controls.
+This SDK is designed for teams that want observability without replacing their existing provider clients, wrappers, retries, auth, or application security controls.
 
 ## Install
 
@@ -10,40 +10,25 @@ Use this SDK when you want visibility into LLM usage without replacing your exis
 pip install cloptima-llm-observability
 ```
 
-If you want to use the `httpx` transport helpers, install the optional extra:
+If you want the `httpx` transport helpers:
 
 ```bash
 pip install "cloptima-llm-observability[httpx]"
 ```
 
-## Configuration
-
-Common environment variables:
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `CLOPTIMA_LLM_OBSERVABILITY_API_KEY` | Yes | Cloptima API key for telemetry writes |
-| `CLOPTIMA_LLM_OBSERVABILITY_APP_ID` | Yes | Application or service identifier |
-| `CLOPTIMA_LLM_OBSERVABILITY_ENABLED` | No | Explicitly enable or disable the SDK |
-
-Recommended optional environment variables:
-
-| Variable | Purpose |
-| --- | --- |
-| `CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT` | Deployment environment such as `dev`, `staging`, or `prod`. Defaults to `production`, so set this explicitly when testing outside production. |
-| `CLOPTIMA_LLM_OBSERVABILITY_TEAM_ID` | Team or ownership group |
-
-The SDK sends bearer-authenticated HTTPS requests to `https://api.cloptima.ai/v1/ai/integrations/sdk/events` by default.
-
 ## Quick start
 
-Use `observe_call(...)` at the point where your application already invokes an LLM provider or an internal AI helper.
+Required configuration:
+
+- `CLOPTIMA_LLM_OBSERVABILITY_API_KEY`
+- `CLOPTIMA_LLM_OBSERVABILITY_APP_ID`
+
+Recommended while testing:
+
+- `CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT=dev`
 
 ```python
-from cloptima_llm_observability import (
-    extract_openai_usage,
-    init_from_env,
-)
+from cloptima_llm_observability import extract_openai_usage, init_from_env
 
 cloptima = init_from_env()
 
@@ -52,44 +37,88 @@ result = cloptima.observe_call(
     model="gpt-4.1-mini",
     call=lambda: summary_service.generate(prompt),
     extract_usage=extract_openai_usage,
-    feature_id="summaries",
-    workflow_id="support-agent",
-    team_id="customer-support",
+    feature_id="summary_generation",
+    workflow_id="support_agent",
     fire_and_forget=False,
 )
 ```
 
-This integration style works well because it:
+By default, the SDK sends bearer-authenticated HTTPS requests to Cloptima at `https://api.cloptima.ai/v1/ai/integrations/sdk/events`.
 
-- keeps your existing provider integration intact
-- captures the most accurate model and feature context
-- avoids SDK-specific coupling throughout your codebase
-- works well with existing wrappers and shared AI services
+If the required configuration is missing, `init_from_env()` returns a disabled pass-through client so local development and tests do not break.
 
-## Async and streaming calls
+## Choose your integration path
 
-If your application already uses async calls or streaming responses, use the matching helpers:
+### Call-site or wrapper boundary
+
+This is the default path for most teams.
+
+Use it when you already know the provider, model, and business context at the point where your code calls an LLM or an existing AI wrapper.
+
+- `observe_call(...)` for direct integration
+- `create_observed_call(...)` for reusable wrappers
+- `wrap_observed_service(...)` to instrument customer-owned service classes
 
 ```python
-result = await cloptima.observe_async_call(
-    provider="anthropic",
-    model="claude-3-5-sonnet",
-    call=lambda: assistant_client.reply(messages),
-    feature_id="chat_reply",
+from cloptima_llm_observability import (
+    extract_openai_usage,
+    init_from_env,
+    wrap_observed_service,
 )
 
-async for chunk in cloptima.observe_async_stream_call(
-    provider="openai",
-    model="gpt-4.1-mini",
-    call=lambda: stream_client.stream(prompt),
-    feature_id="live_answer",
-):
-    print(chunk)
+
+class SummaryService:
+    def generate_summary(self, prompt: str):
+        return openai.responses.create(model="gpt-4.1-mini", input=prompt)
+
+
+cloptima = init_from_env()
+summary_service = wrap_observed_service(
+    cloptima,
+    SummaryService(),
+    {
+        "generate_summary": {
+            "kind": "call",
+            "options": {
+                "provider": "openai",
+                "model": "gpt-4.1-mini",
+                "extract_usage": extract_openai_usage,
+                "fire_and_forget": False,
+            },
+            "resolve_overrides": lambda prompt: {
+                "attribution": {
+                    "feature_id": "summary_generation",
+                },
+            },
+        }
+    },
+)
 ```
 
-## Shared transport integration
+### Context-first attribution
 
-If your application centralizes outbound LLM calls behind a shared `httpx` transport, instrument that boundary instead:
+Use context helpers when you want workflow or feature attribution to apply across nested calls without threading more parameters through your own service signatures.
+
+- `with_attribution(...)`
+- `run_with_attribution(...)`
+- `with_workflow(...)`
+- `with_task(...)`
+- `@workflow(...)`
+- `@task(...)`
+
+```python
+from cloptima_llm_observability import with_task, with_workflow
+
+with with_workflow("support_agent", tenant_id="acme-prod"):
+    with with_task("draft_reply", team_id="customer-support"):
+        summary_service.generate_summary(prompt)
+```
+
+Per-call attribution still works and overrides context when needed.
+
+### Shared transport integration
+
+If your application centralizes outbound LLM calls behind `httpx`, instrument that shared boundary:
 
 ```python
 import httpx
@@ -107,28 +136,45 @@ transport = instrument_httpx_transport(
 client = httpx.Client(transport=transport)
 ```
 
-This is useful for broad coverage, but it has less application context than `observe_call(...)`. Prefer `observe_call(...)` when you already know the provider, model, and feature at the call site.
+This gives broad coverage, but it has less business context than call-site or wrapper-boundary integration.
 
-## OTLP mode
+### OTLP delivery to Cloptima
 
-The SDK supports two delivery modes:
+Use `otlp_http` when your enterprise prefers OpenTelemetry-compatible payloads but still wants to send that telemetry to Cloptima.
 
-- `cloptima_http`
-- `otlp_http`
+- `cloptima_http` is the default delivery mode
+- `otlp_http` sends OpenTelemetry-compatible payloads to Cloptima's OTLP receiver
 
-Use `otlp_http` when you want the SDK to send OpenTelemetry-compatible payloads to Cloptima's OTLP-compatible receiver instead of the standard SDK telemetry endpoint.
+```bash
+CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE=otlp_http
+CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_NAME=agent-api
+CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_VERSION=2026.06.14
+```
 
-`otlp_http` is still a Cloptima delivery mode. The SDK keeps the OTLP route fixed and only lets you override the Cloptima API domain or environment.
+If you already operate an OTEL collector and emit GenAI spans, you can also send OTLP data to Cloptima without using this SDK. Use the SDK OTLP mode when you want application-managed instrumentation that still fits an OTLP-shaped delivery contract.
 
-Advanced configuration:
+## Built-in extractors and compatibility
 
-- `CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE` selects `cloptima_http` or `otlp_http`
-- `CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL` overrides the Cloptima API domain while the SDK keeps the ingest routes fixed
-- `CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_NAME` and `CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_VERSION` customize OTLP service metadata
+Built-in usage extractors cover:
+
+- OpenAI
+- Azure OpenAI
+- Anthropic
+- Gemini
+- Vertex AI
+- Bedrock
+
+If a provider response shape drifts, you do not need to replace the whole extractor path. Compose or patch it instead:
+
+- `try_extract_usage(...)`
+- `compose_usage_extractors(...)`
+- `with_usage_overrides(...)`
+- `create_mapped_usage_extractor(...)`
+- `list_supported_providers()`
 
 ## Attribution fields
 
-The most useful fields for reporting and ownership are:
+Common ownership and reporting fields:
 
 - `app_id`
 - `environment`
@@ -137,17 +183,17 @@ The most useful fields for reporting and ownership are:
 - `workflow_id`
 - `cost_center`
 - `business_unit`
+- `product`
 - `tenant_id`
+- `end_customer_id`
 - `customer_segment`
-- `cloud_account_id`
-- `cluster_id`
-- `repository_id`
+- `release`
 
-You can pass them through `default_attribution`, or directly on `observe_call(...)` / `observe_stream_call(...)`.
+Set defaults once in `default_attribution`, set them in context, or override them per call.
 
-## Metadata controls
+## Metadata and privacy
 
-Use `metadata_policy` to control what custom metadata is retained:
+Use `metadata_policy` to control how custom metadata is retained:
 
 - `metadata_only`
 - `allowlisted_metadata`
@@ -156,55 +202,27 @@ Use `metadata_policy` to control what custom metadata is retained:
 
 Sensitive-looking keys such as prompts, messages, credentials, and secrets are treated conservatively by default.
 
-## Validation helpers
+## Validation and local previews
 
-These helpers are useful when you want to inspect payloads locally before sending traffic to Cloptima:
+Use these helpers in local tests, CI, or rollout checks:
 
 - `preview_event_payload(...)`
 - `preview_batch_payload(...)`
 - `preview_otlp_request(...)`
 - `validate_payload(...)`
 
-They return payload previews in memory and do not send network traffic.
+They build or validate payloads in memory and do not send network traffic.
 
 ## Examples
 
-See the `examples/` directory for:
+Public examples live in `examples/`:
 
-- OpenAI call-site instrumentation
-- OpenTelemetry-compatible delivery to Cloptima
-- Anthropic call-site instrumentation
-- Gemini call-site instrumentation
-- custom wrapper integration
-- httpx transport integration
-
-## Public API
-
-Stable core surface:
-
-- `CloptimaLLMObservability`
-- `init_from_env`
-- `disabled_client`
-- `observe`
-- `observe_call`
-- `observe_async_call`
-- `observe_stream`
-- `observe_stream_call`
-- `record`
-- `record_batch`
-- `record_async`
-- provider usage extractors
-
-Additional helper surface:
-
-- `instrument_httpx_client`
-- `instrument_httpx_transport`
-- `instrument_openai_compatible_response`
-- `instrument_openai_compatible_stream`
-- `ainstrument_openai_compatible_response`
-- `ainstrument_openai_compatible_stream`
-- `instrument_fastapi_request_context`
-- `instrument_flask_request_context`
+- `basic.py`: direct call-site integration
+- `custom_wrapper.py`: existing service wrapper integration
+- `workflow_context.py`: context-first attribution without signature bloat
+- `httpx_transport.py`: shared `httpx` integration
+- `otlp_basic.py`: OTLP-compatible delivery to Cloptima
+- `openai_basic.py`, `anthropic_basic.py`, `gemini_basic.py`: provider-specific extractor examples
 
 ## Troubleshooting
 
@@ -212,20 +230,13 @@ No telemetry arrives:
 
 - verify the API key is valid for Cloptima telemetry ingestion
 - check `client.is_enabled()`
-- if you use advanced routing overrides, verify `CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL` points at the intended Cloptima environment
 - inspect a sample event with `validate_payload(preview_event_payload(...))`
 
-Configuration behavior:
+Unexpected provider response shape:
 
-- `init_from_env()` returns a disabled pass-through client when configuration is absent
-- if you explicitly enable the SDK with incomplete config, initialization stays non-blocking by default unless `strict=True`
-
-## Payload contracts
-
-- single event schema: `cloptima.llm.event.v1`
-- batch schema: `cloptima.llm.batch.v1`
-
-SDK envelopes also include `sdk_delivery_stats` for delivery monitoring.
+- start with the closest built-in extractor
+- patch field differences with `with_usage_overrides(...)` or `create_mapped_usage_extractor(...)`
+- compare against `list_supported_providers()` if you need a supported-provider snapshot
 
 ## Support
 

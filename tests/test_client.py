@@ -14,7 +14,14 @@ from unittest.mock import patch
 from cloptima_llm_observability import (
     ainstrument_openai_compatible_response,
     ainstrument_openai_compatible_stream,
+    bind_observed_async_stream,
+    bind_observed_call,
+    list_supported_providers,
     CloptimaLLMObservability,
+    create_observed_async_stream,
+    create_observed_async_call,
+    create_observed_call,
+    create_observed_stream,
     LLMAttribution,
     LLMUsageEvent,
     MetadataPrivacyPolicy,
@@ -37,13 +44,30 @@ from cloptima_llm_observability import (
     instrument_openai_compatible_stream,
     is_enabled,
     preview_batch_payload,
+    compose_usage_extractors,
+    create_mapped_usage_extractor,
     preview_event_payload,
     preview_otlp_request,
+    get_provider_stream_usage_extractor,
+    get_provider_usage_extractor,
+    PROVIDER_SUPPORT_MATRIX,
+    PROVIDER_USAGE_EXTRACTORS,
+    run_with_task,
+    try_extract_usage,
     extract_openai_usage,
     extract_openai_stream_usage,
     extract_vertex_stream_usage,
     extract_vertex_usage,
+    run_with_attribution,
+    run_with_workflow,
+    task,
     validate_payload,
+    with_task,
+    with_usage_overrides,
+    with_attribution,
+    with_workflow,
+    workflow,
+    wrap_observed_service,
 )
 
 TEST_API_BASE_URL = "https://sdk-ingest.example.cloptima.ai"
@@ -141,6 +165,11 @@ class _FakeHttpxClient:
         if self._error is not None:
             raise self._error
         return self._response
+
+
+async def _async_chunk_stream(*chunks):
+    for chunk in chunks:
+        yield chunk
 
 
 class _FakeAsyncHttpxClient:
@@ -564,6 +593,396 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         self.assertEqual(body["metadata"]["route"], "/summaries")
         self.assertNotIn("prompt", body["metadata"])
 
+    def test_with_attribution_applies_ambient_attribution_and_preserves_explicit_overrides(self) -> None:
+        observed_requests = []
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            async_http_client=_FakeAsyncClient(timeout=3.0),
+        )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            with with_attribution(team_id="platform", feature_id="summaries", workflow_id="ambient-workflow"):
+                client.record(LLMUsageEvent(provider="openai", model="gpt-4o-mini"))
+                client.observe_call(
+                    provider="openai",
+                    model="gpt-4o-mini",
+                    call=lambda: {
+                        "id": "chatcmpl-context-1",
+                        "model": "gpt-4o-mini",
+                        "usage": {
+                            "prompt_tokens": 3,
+                            "completion_tokens": 2,
+                            "total_tokens": 5,
+                        },
+                    },
+                    extract_usage=extract_openai_usage,
+                    workflow_id="explicit-workflow",
+                    fire_and_forget=False,
+                )
+
+        self.assertEqual(len(observed_requests), 2)
+        self.assertEqual(observed_requests[0]["metadata"]["team_id"], "platform")
+        self.assertEqual(observed_requests[0]["metadata"]["feature_id"], "summaries")
+        self.assertEqual(observed_requests[0]["metadata"]["workflow_id"], "ambient-workflow")
+        self.assertEqual(observed_requests[1]["metadata"]["team_id"], "platform")
+        self.assertEqual(observed_requests[1]["metadata"]["feature_id"], "summaries")
+        self.assertEqual(observed_requests[1]["metadata"]["workflow_id"], "explicit-workflow")
+
+    def test_run_with_attribution_preserves_context_for_async_callbacks(self) -> None:
+        async def callback():
+            await asyncio.sleep(0)
+            return preview_event_payload(
+                LLMUsageEvent(provider="openai", model="gpt-4o-mini"),
+                default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            )
+
+        payload = asyncio.run(
+            run_with_attribution(
+                callback,
+                workflow_id="async-workflow",
+                feature_id="summaries",
+            )
+        )
+
+        self.assertEqual(payload["metadata"]["workflow_id"], "async-workflow")
+        self.assertEqual(payload["metadata"]["feature_id"], "summaries")
+
+    def test_run_with_attribution_preserves_context_for_async_generators(self) -> None:
+        async def stream():
+            await asyncio.sleep(0)
+            yield preview_event_payload(
+                LLMUsageEvent(provider="openai", model="gpt-4o-mini"),
+                default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            )["metadata"]["workflow_id"]
+
+        async def collect() -> List[str]:
+            values = []
+            async for value in run_with_attribution(stream, workflow_id="async-stream"):
+                values.append(value)
+            return values
+
+        self.assertEqual(asyncio.run(collect()), ["async-stream"])
+
+    def test_run_with_attribution_rejects_non_callable_awaitables_with_helpful_error(self) -> None:
+        coroutine = asyncio.sleep(0)
+        try:
+            with self.assertRaises(TypeError) as raised:
+                run_with_attribution(coroutine, workflow_id="async-stream")
+            self.assertIn("expects a zero-argument callable", str(raised.exception))
+            self.assertIn("lambda: coroutine(...)", str(raised.exception))
+        finally:
+            coroutine.close()
+
+    def test_workflow_and_task_helpers_set_named_attribution_defaults(self) -> None:
+        observed_requests = []
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+        )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            with with_workflow("order-checkout"):
+                with with_task("llm-summary"):
+                    client.record(LLMUsageEvent(provider="openai", model="gpt-4o-mini"))
+                with with_task("ignored-task-name"):
+                    client.record(
+                        LLMUsageEvent(
+                            provider="openai",
+                            model="gpt-4o-mini",
+                            attribution={"feature_id": "explicit-feature"},
+                        )
+                    )
+
+        self.assertEqual(len(observed_requests), 2)
+        self.assertEqual(observed_requests[0]["metadata"]["workflow_id"], "order-checkout")
+        self.assertEqual(observed_requests[0]["metadata"]["feature_id"], "llm-summary")
+        self.assertEqual(observed_requests[1]["metadata"]["workflow_id"], "order-checkout")
+        self.assertEqual(observed_requests[1]["metadata"]["feature_id"], "explicit-feature")
+
+        preview = run_with_workflow(
+            lambda: run_with_task(
+                lambda: preview_event_payload(
+                    LLMUsageEvent(provider="openai", model="gpt-4o-mini"),
+                    default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+                ),
+                "preview-task",
+            ),
+            "preview-workflow",
+        )
+        self.assertEqual(preview["metadata"]["workflow_id"], "preview-workflow")
+        self.assertEqual(preview["metadata"]["feature_id"], "preview-task")
+
+    def test_client_instance_context_manager_helpers_delegate_to_module_context(self) -> None:
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+        )
+
+        with client.with_workflow("instance-workflow", team_id="platform"):
+            with client.with_task("instance-task", tenant_id="acme-prod"):
+                preview = preview_event_payload(
+                    LLMUsageEvent(provider="openai", model="gpt-4o-mini"),
+                    default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+                )
+
+        self.assertEqual(preview["metadata"]["workflow_id"], "instance-workflow")
+        self.assertEqual(preview["metadata"]["feature_id"], "instance-task")
+        self.assertEqual(preview["metadata"]["team_id"], "platform")
+        self.assertEqual(preview["metadata"]["tenant_id"], "acme-prod")
+
+    def test_workflow_and_task_decorators_apply_context_for_sync_and_async_functions(self) -> None:
+        @workflow("billing-run")
+        @task("summary-step")
+        def sync_payload():
+            return preview_event_payload(
+                LLMUsageEvent(provider="openai", model="gpt-4o-mini"),
+                default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            )
+
+        @workflow("async-billing-run")
+        @task("async-summary-step")
+        async def async_payload():
+            await asyncio.sleep(0)
+            return preview_event_payload(
+                LLMUsageEvent(provider="openai", model="gpt-4o-mini"),
+                default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            )
+
+        sync_result = sync_payload()
+        async_result = asyncio.run(async_payload())
+
+        self.assertEqual(sync_result["metadata"]["workflow_id"], "billing-run")
+        self.assertEqual(sync_result["metadata"]["feature_id"], "summary-step")
+        self.assertEqual(async_result["metadata"]["workflow_id"], "async-billing-run")
+        self.assertEqual(async_result["metadata"]["feature_id"], "async-summary-step")
+
+    def test_create_observed_call_and_async_stream_reduce_wrapper_boilerplate(self) -> None:
+        observed_requests = []
+        _FakeAsyncClient.observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            async_http_client=_FakeAsyncClient(timeout=3.0),
+        )
+
+        observe_openai = create_observed_call(
+            client,
+            provider="openai",
+            model="gpt-4o-mini",
+            extract_usage=extract_openai_usage,
+            attribution={"feature_id": "wrapper-default"},
+            metadata={"channel": "sync"},
+            fire_and_forget=False,
+        )
+
+        observe_stream = create_observed_async_stream(
+            client,
+            provider="anthropic",
+            model="claude-3-5-sonnet",
+            extract_usage=extract_anthropic_stream_usage,
+            metadata={"channel": "stream"},
+            fire_and_forget=False,
+        )
+
+        async def run_stream():
+            emitted = []
+            async for chunk in observe_stream(
+                lambda: _async_chunk_stream(
+                    {"message": {"id": "msg-factory-1", "model": "claude-3-5-sonnet"}},
+                    {"usage": {"input_tokens": 4, "output_tokens": 2}},
+                ),
+                attribution={"workflow_id": "wrapper-stream"},
+            ):
+                emitted.append(chunk)
+            return emitted
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            response = observe_openai(
+                lambda: {
+                    "id": "chatcmpl-factory-1",
+                    "model": "gpt-4o-mini",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+                },
+                attribution={"workflow_id": "wrapper-invoke"},
+                metadata={"operation": "summarize"},
+            )
+            emitted = asyncio.run(run_stream())
+
+        self.assertEqual(response["id"], "chatcmpl-factory-1")
+        self.assertEqual(len(emitted), 2)
+        self.assertEqual(len(observed_requests), 1)
+        self.assertEqual(observed_requests[0]["metadata"]["feature_id"], "wrapper-default")
+        self.assertEqual(observed_requests[0]["metadata"]["workflow_id"], "wrapper-invoke")
+        self.assertEqual(observed_requests[0]["metadata"]["channel"], "sync")
+        self.assertEqual(observed_requests[0]["metadata"]["operation"], "summarize")
+        async_body = json.loads(_FakeAsyncClient.observed["content"].decode("utf-8"))
+        self.assertEqual(async_body["metadata"]["workflow_id"], "wrapper-stream")
+        self.assertEqual(async_body["metadata"]["channel"], "stream")
+
+    def test_create_observed_async_call_and_sync_stream_cover_remaining_wrapper_helpers(self) -> None:
+        observed_requests = []
+        _FakeAsyncClient.observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            async_http_client=_FakeAsyncClient(timeout=3.0),
+        )
+
+        observe_async = create_observed_async_call(
+            client,
+            provider="openai",
+            model="gpt-4o-mini",
+            extract_usage=extract_openai_usage,
+            metadata={"channel": "async-call"},
+            fire_and_forget=False,
+        )
+        observe_sync_stream = create_observed_stream(
+            client,
+            provider="anthropic",
+            model="claude-3-5-sonnet",
+            extract_usage=extract_anthropic_stream_usage,
+            metadata={"channel": "sync-stream"},
+            fire_and_forget=False,
+        )
+
+        async def run_async_call():
+            return await observe_async(
+                lambda: {
+                    "id": "chatcmpl-factory-async-1",
+                    "model": "gpt-4o-mini",
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+                },
+                attribution={"workflow_id": "wrapper-async-call"},
+            )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            response = asyncio.run(run_async_call())
+            emitted = list(
+                observe_sync_stream(
+                    lambda: iter([
+                        {"message": {"id": "msg-factory-sync-1", "model": "claude-3-5-sonnet"}},
+                        {"usage": {"input_tokens": 7, "output_tokens": 2}},
+                    ]),
+                    attribution={"workflow_id": "wrapper-sync-stream"},
+                )
+            )
+
+        self.assertEqual(response["id"], "chatcmpl-factory-async-1")
+        self.assertEqual(len(emitted), 2)
+        async_body = json.loads(_FakeAsyncClient.observed["content"].decode("utf-8"))
+        self.assertEqual(async_body["metadata"]["workflow_id"], "wrapper-async-call")
+        self.assertEqual(async_body["metadata"]["channel"], "async-call")
+        self.assertEqual(observed_requests[0]["metadata"]["workflow_id"], "wrapper-sync-stream")
+        self.assertEqual(observed_requests[0]["metadata"]["channel"], "sync-stream")
+
+    def test_bind_observed_call_and_async_stream_wrap_existing_service_methods(self) -> None:
+        observed_requests = []
+        _FakeAsyncClient.observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            async_http_client=_FakeAsyncClient(timeout=3.0),
+        )
+
+        class ProviderService:
+            def generate(self, prompt, request_id):
+                return {
+                    "id": f"chatcmpl-{request_id}",
+                    "model": "gpt-4o-mini",
+                    "usage": {
+                        "prompt_tokens": len(prompt),
+                        "completion_tokens": 2,
+                        "total_tokens": len(prompt) + 2,
+                    },
+                }
+
+            async def stream(self, prompt, request_id):
+                async for chunk in _async_chunk_stream(
+                    {"message": {"id": f"msg-{request_id}", "model": "claude-3-5-sonnet"}},
+                    {"usage": {"input_tokens": len(prompt), "output_tokens": 1}},
+                ):
+                    yield chunk
+
+        service = ProviderService()
+        observed_generate = bind_observed_call(
+            client,
+            service.generate,
+            provider="openai",
+            model="gpt-4o-mini",
+            extract_usage=extract_openai_usage,
+            metadata={"service": "provider-service"},
+            fire_and_forget=False,
+            resolve_overrides=lambda _prompt, request_id: {
+                "request_id": request_id,
+                "attribution": {"workflow_id": f"wf-{request_id}"},
+            },
+        )
+        observed_stream = bind_observed_async_stream(
+            client,
+            service.stream,
+            provider="anthropic",
+            model="claude-3-5-sonnet",
+            extract_usage=extract_anthropic_stream_usage,
+            metadata={"service": "provider-service-stream"},
+            fire_and_forget=False,
+            resolve_overrides=lambda _prompt, request_id: {
+                "request_id": request_id,
+                "attribution": {"workflow_id": f"wf-{request_id}"},
+            },
+        )
+
+        async def run_stream():
+            emitted = []
+            async for chunk in observed_stream("hey", "req-456"):
+                emitted.append(chunk)
+            return emitted
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            response = observed_generate("hello", "req-123")
+            emitted = asyncio.run(run_stream())
+
+        self.assertEqual(response["id"], "chatcmpl-req-123")
+        self.assertEqual(len(emitted), 2)
+        self.assertEqual(observed_requests[0]["request_id"], "req-123")
+        self.assertEqual(observed_requests[0]["metadata"]["workflow_id"], "wf-req-123")
+        self.assertEqual(observed_requests[0]["metadata"]["service"], "provider-service")
+        async_body = json.loads(_FakeAsyncClient.observed["content"].decode("utf-8"))
+        self.assertEqual(async_body["request_id"], "req-456")
+        self.assertEqual(async_body["metadata"]["workflow_id"], "wf-req-456")
+        self.assertEqual(async_body["metadata"]["service"], "provider-service-stream")
+
     def test_record_posts_otlp_json_when_otlp_delivery_mode_is_enabled(self) -> None:
         observed = {}
 
@@ -959,6 +1378,314 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
                 "total_tokens": 3,
             },
         )
+
+    def test_provider_extractors_accept_object_like_responses_and_composition_helpers(self) -> None:
+        class OpenAIModel:
+            def model_dump(self):
+                return {
+                    "id": "chatcmpl-model-dump",
+                    "model": "gpt-4o-mini",
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 5,
+                        "total_tokens": 13,
+                    },
+                }
+
+        class GeminiModel:
+            def dict(self):
+                return {
+                    "responseId": "gemini-dict-1",
+                    "modelVersion": "gemini-2.5-flash",
+                    "usageMetadata": {
+                        "promptTokenCount": 6,
+                        "responseTokenCount": 4,
+                        "totalTokenCount": 10,
+                    },
+                }
+
+        class BedrockModel:
+            def toJSON(self):
+                return {
+                    "request_id": "bedrock-json-1",
+                    "model_id": "anthropic.claude-3-5-sonnet",
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "total_tokens": 15,
+                    },
+                }
+
+        self.assertEqual(
+            extract_openai_usage(OpenAIModel()),
+            {
+                "provider": "openai",
+                "provider_request_id": "chatcmpl-model-dump",
+                "model": "gpt-4o-mini",
+                "input_tokens": 8,
+                "output_tokens": 5,
+                "total_tokens": 13,
+            },
+        )
+        self.assertEqual(
+            extract_gemini_usage(GeminiModel()),
+            {
+                "provider": "gemini",
+                "provider_request_id": "gemini-dict-1",
+                "model": "gemini-2.5-flash",
+                "input_tokens": 6,
+                "output_tokens": 4,
+                "total_tokens": 10,
+            },
+        )
+        self.assertEqual(
+            extract_bedrock_usage(BedrockModel()),
+            {
+                "provider": "bedrock",
+                "provider_request_id": "bedrock-json-1",
+                "model": "anthropic.claude-3-5-sonnet",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "total_tokens": 15,
+            },
+        )
+
+        fallback_extractor = compose_usage_extractors(
+            lambda _: {},
+            extract_openai_usage,
+        )
+        self.assertEqual(
+            fallback_extractor(OpenAIModel()),
+            {
+                "provider": "openai",
+                "provider_request_id": "chatcmpl-model-dump",
+                "model": "gpt-4o-mini",
+                "input_tokens": 8,
+                "output_tokens": 5,
+                "total_tokens": 13,
+            },
+        )
+
+        self.assertEqual(
+            try_extract_usage(GeminiModel(), lambda _: {}, extract_gemini_usage),
+            {
+                "provider": "gemini",
+                "provider_request_id": "gemini-dict-1",
+                "model": "gemini-2.5-flash",
+                "input_tokens": 6,
+                "output_tokens": 4,
+                "total_tokens": 10,
+            },
+        )
+
+        overridden = with_usage_overrides(
+            extract_anthropic_usage,
+            lambda extracted, _input: {**extracted, "output_tokens": 9},
+        )
+        self.assertEqual(
+            overridden(
+                {
+                    "id": "msg-override-1",
+                    "model": "claude-3-5-sonnet",
+                    "usage": {
+                        "input_tokens": 4,
+                        "output_tokens": 2,
+                        "total_tokens": 6,
+                    },
+                }
+            ),
+            {
+                "provider": "anthropic",
+                "provider_request_id": "msg-override-1",
+                "model": "claude-3-5-sonnet",
+                "input_tokens": 4,
+                "output_tokens": 9,
+                "total_tokens": 6,
+            },
+        )
+
+    def test_create_mapped_usage_extractor_maps_nested_custom_payloads(self) -> None:
+        extractor = create_mapped_usage_extractor(
+            defaults={
+                "provider": "custom_provider",
+            },
+            fields={
+                "provider_request_id": ["response.id", "meta.request_id"],
+                "model": "meta.model_name",
+                "status": "meta.status",
+            },
+            number_fields={
+                "input_tokens": "usage.input",
+                "output_tokens": "usage.output",
+                "total_tokens": "usage.total",
+                "latency_ms": "timing.latency_ms",
+            },
+            boolean_fields={
+                "cache_hit": "cache.hit",
+            },
+            extra_usage_units={
+                "images": "usage.images_generated",
+            },
+            metadata={
+                "region": "meta.region",
+                "route": "meta.route",
+            },
+        )
+
+        self.assertEqual(
+            extractor(
+                {
+                    "response": {"id": "resp-custom-1"},
+                    "meta": {
+                        "model_name": "custom-model",
+                        "status": "succeeded",
+                        "region": "us-central1",
+                        "route": "/v1/generate",
+                    },
+                    "usage": {
+                        "input": 7,
+                        "output": 3,
+                        "total": 10,
+                        "images_generated": 2,
+                    },
+                    "timing": {"latency_ms": 145},
+                    "cache": {"hit": True},
+                }
+            ),
+            {
+                "provider": "custom_provider",
+                "provider_request_id": "resp-custom-1",
+                "model": "custom-model",
+                "status": "succeeded",
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "total_tokens": 10,
+                "latency_ms": 145,
+                "cache_hit": True,
+                "extra_usage_units": {"images": 2},
+                "metadata": {
+                    "region": "us-central1",
+                    "route": "/v1/generate",
+                },
+            },
+        )
+
+    def test_provider_extractor_registry_resolves_aliases_and_fixture_coverage_stays_aligned(self) -> None:
+        self.assertIs(get_provider_usage_extractor("azure"), extract_azure_openai_usage)
+        self.assertIs(get_provider_usage_extractor("vertex-ai"), extract_vertex_usage)
+        self.assertIs(get_provider_stream_usage_extractor("bedrock"), extract_bedrock_stream_usage)
+        self.assertIsNone(get_provider_usage_extractor(None))
+        self.assertIsNone(get_provider_stream_usage_extractor(None))
+        self.assertTrue(any(descriptor["provider"] == "openai" for descriptor in PROVIDER_USAGE_EXTRACTORS))
+        self.assertEqual(
+            list_supported_providers(),
+            [{**dict(descriptor), "aliases": list(descriptor["aliases"])} for descriptor in PROVIDER_SUPPORT_MATRIX],
+        )
+        self.assertTrue(all(descriptor["response"] is True for descriptor in PROVIDER_SUPPORT_MATRIX))
+        self.assertTrue(any(descriptor["provider"] == "anthropic" and descriptor["stream"] is True for descriptor in PROVIDER_SUPPORT_MATRIX))
+        with self.assertRaises(AttributeError):
+            PROVIDER_USAGE_EXTRACTORS.append({})  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            PROVIDER_USAGE_EXTRACTORS[0]["provider"] = "mutated"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            PROVIDER_USAGE_EXTRACTORS[0]["aliases"] += ("mutated",)  # type: ignore[index]
+
+        fixture_candidates = [
+            Path(__file__).resolve().parents[2] / "llm-observability-fixtures" / "provider_usage_replay.json",
+            Path(__file__).resolve().parents[1] / "llm-observability-fixtures" / "provider_usage_replay.json",
+        ]
+        fixture_path = next((path for path in fixture_candidates if path.exists()), None)
+        if fixture_path is None:
+            raise FileNotFoundError("provider_usage_replay.json fixture not found")
+        fixtures = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for fixture in fixtures:
+            extractor = (
+                get_provider_stream_usage_extractor(fixture["provider"])
+                if fixture["kind"] == "stream"
+                else get_provider_usage_extractor(fixture["provider"])
+            )
+            self.assertIsNotNone(extractor, f"missing registry extractor for {fixture['provider']}/{fixture['kind']}")
+
+    def test_wrap_observed_service_wraps_multiple_existing_service_methods_together(self) -> None:
+        observed_requests = []
+        _FakeAsyncClient.observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed_requests.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse()
+
+        client = CloptimaLLMObservability(
+            api_base_url=TEST_API_BASE_URL,
+            api_key="pat-test",
+            default_attribution=LLMAttribution(app_id="agent-api", environment="dev"),
+            async_http_client=_FakeAsyncClient(timeout=3.0),
+        )
+
+        class SharedAIService:
+            def plain_helper(self):
+                return "helper-ok"
+
+            def summarize(self, text, request_id):
+                return {
+                    "id": f"chatcmpl-{request_id}",
+                    "model": "gpt-4o-mini",
+                    "usage": {
+                        "prompt_tokens": len(text),
+                        "completion_tokens": 2,
+                        "total_tokens": len(text) + 2,
+                    },
+                }
+
+            async def stream_reply(self, text, request_id):
+                async for chunk in _async_chunk_stream(
+                    {"message": {"id": f"msg-{request_id}", "model": "claude-3-5-sonnet"}},
+                    {"usage": {"input_tokens": len(text), "output_tokens": 1}},
+                ):
+                    yield chunk
+
+        wrapped = wrap_observed_service(
+            client,
+            SharedAIService(),
+            {
+                "summarize": {
+                    "kind": "call",
+                    "options": {
+                        "provider": "openai",
+                        "model": "gpt-4o-mini",
+                        "extract_usage": extract_openai_usage,
+                        "fire_and_forget": False,
+                    },
+                    "resolve_overrides": lambda _text, request_id: {"request_id": request_id},
+                },
+                "stream_reply": {
+                    "kind": "async_stream",
+                    "options": {
+                        "provider": "anthropic",
+                        "model": "claude-3-5-sonnet",
+                        "extract_usage": extract_anthropic_stream_usage,
+                        "fire_and_forget": False,
+                    },
+                    "resolve_overrides": lambda _text, request_id: {"request_id": request_id},
+                },
+            },
+        )
+
+        async def run_stream():
+            emitted = []
+            async for chunk in wrapped.stream_reply("hey", "svc-2"):
+                emitted.append(chunk)
+            return emitted
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            response = wrapped.summarize("hello", "svc-1")
+            emitted = asyncio.run(run_stream())
+
+        self.assertEqual(response["id"], "chatcmpl-svc-1")
+        self.assertEqual(len(emitted), 2)
+        self.assertEqual(wrapped.plain_helper(), "helper-ok")
+        self.assertEqual(observed_requests[0]["request_id"], "svc-1")
+        async_body = json.loads(_FakeAsyncClient.observed["content"].decode("utf-8"))
+        self.assertEqual(async_body["request_id"], "svc-2")
 
     def test_observe_records_failure_when_synchronous(self) -> None:
         observed = {}
@@ -2067,6 +2794,45 @@ class CloptimaLLMObservabilityTests(unittest.TestCase):
         )
         self.assertEqual(batch_payload["schema_version"], "cloptima.llm.batch.v1")
         self.assertEqual([event["source_event_id"] for event in batch_payload["events"]], ["evt-1", "evt-2"])
+
+    def test_preview_helpers_accept_plain_event_mappings_with_flat_attribution_fields(self) -> None:
+        payload = preview_event_payload(
+            {
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "request_id": "req-preview-mapping-1",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "app_id": "agent-api",
+                "environment": "dev",
+                "feature_id": "customer_summary",
+                "metadata": {"route": "/chat"},
+            }
+        )
+        batch_payload = preview_batch_payload(
+            [
+                {
+                    "provider": "openai",
+                    "model": "gpt-4o-mini",
+                    "source_event_id": "evt-map-1",
+                    "app_id": "agent-api",
+                    "environment": "dev",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "source_event_id": "evt-map-2",
+                    "app_id": "agent-api",
+                    "environment": "dev",
+                },
+            ]
+        )
+
+        self.assertEqual(payload["metadata"]["app_id"], "agent-api")
+        self.assertEqual(payload["metadata"]["environment"], "dev")
+        self.assertEqual(payload["metadata"]["feature_id"], "customer_summary")
+        self.assertEqual(payload["total_tokens"], 15)
+        self.assertEqual([event["source_event_id"] for event in batch_payload["events"]], ["evt-map-1", "evt-map-2"])
 
     def test_validate_payload_reports_malformed_event_and_batch_payloads(self) -> None:
         invalid = validate_payload(

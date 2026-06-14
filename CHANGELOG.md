@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.1.1
+## 0.1.2
 
-- Simplified setup so customers only configure Cloptima credentials and attribution, with one advanced domain override for non-production environments.
-- Clarified OTLP delivery as a supported way to send OpenTelemetry-compatible telemetry to Cloptima.
-- Added clearer examples and onboarding guidance for both standard SDK delivery and OTLP delivery to Cloptima.
+- Added stronger public examples for existing wrapper integrations, context-based attribution, and OTLP-compatible delivery to Cloptima.
+- Reworked the README around customer onboarding paths instead of long helper lists.
+- Clarified extractor customization guidance for provider response drift.
 
 ## 0.1.0
 

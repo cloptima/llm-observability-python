@@ -1,7 +1,11 @@
 import json
 import urllib.request
 
-from cloptima_llm_observability import extract_openai_usage, init_from_env, wrap_observed_service
+from cloptima_llm_observability import (
+    extract_openai_usage,
+    init_from_env,
+    wrap_observed_service,
+)
 
 
 class _FakeResponse:
@@ -17,16 +21,16 @@ class _FakeResponse:
         return b"{}"
 
 
-class SummaryService:
-    def generate_summary(self, prompt: str):
+class DraftingService:
+    def draft_reply(self, prompt: str):
         return {
-            "id": "chatcmpl-wrapper-example",
+            "id": "chatcmpl-workflow-context",
             "model": "gpt-4.1-mini",
             "input": prompt,
             "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": 7,
-                "total_tokens": 19,
+                "prompt_tokens": 18,
+                "completion_tokens": 9,
+                "total_tokens": 27,
             },
         }
 
@@ -36,8 +40,9 @@ def main() -> None:
 
     def fake_urlopen(request, timeout):
         payload = json.loads((request.data or b"{}").decode("utf-8"))
-        if payload.get("metadata", {}).get("integration_mode") != "shared_service":
-            raise RuntimeError("unexpected integration mode")
+        metadata = payload.get("metadata") or {}
+        if metadata.get("workflow_id") != "support_agent" or metadata.get("feature_id") != "draft_reply":
+            raise RuntimeError("workflow context was not emitted")
         return _FakeResponse()
 
     urllib.request.urlopen = fake_urlopen
@@ -49,27 +54,25 @@ def main() -> None:
                 "CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT": "dev",
             }
         )
-        summary_service = wrap_observed_service(
+        drafting_service = wrap_observed_service(
             client,
-            SummaryService(),
+            DraftingService(),
             {
-                "generate_summary": {
+                "draft_reply": {
                     "kind": "call",
                     "options": {
                         "provider": "openai",
                         "model": "gpt-4.1-mini",
                         "extract_usage": extract_openai_usage,
                         "fire_and_forget": False,
-                        "metadata": {"integration_mode": "shared_service"},
-                    },
-                    "resolve_overrides": lambda prompt: {
-                        "attribution": {"feature_id": "support_summary"},
-                        "metadata": {"prompt_length": len(prompt)},
                     },
                 }
             },
         )
-        summary_service.generate_summary("Summarize the customer thread.")
+
+        with client.with_workflow("support_agent", tenant_id="acme-prod"):
+            with client.with_task("draft_reply", team_id="customer-support"):
+                drafting_service.draft_reply("Draft a calm response to the customer.")
     finally:
         urllib.request.urlopen = original_urlopen
 
